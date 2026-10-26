@@ -1,13 +1,13 @@
 /**
  * LE 31 — serveur (Google Apps Script lié au Google Sheet « Le 31 »)
- * Version 1.2 : profils, comptes perso privés, accès par appareil, liens à usage unique.
+ * Version 1.3 : connexion d'un appareil par GET (plus robuste), erreurs toujours renvoyées en JSON.
  *
  * À coller dans : Google Sheet > Extensions > Apps Script (remplacer tout le contenu).
  * Ensuite : exécuter une fois la fonction « installer », puis Déployer > Nouveau déploiement > Application Web.
  * Voir le tuto d'installation (iPad ou PC).
  */
 
-const VERSION_SERVEUR = '1.2';
+const VERSION_SERVEUR = '1.3';
 const VALIDITE_LIEN_JOURS = 14;
 
 // Onglets du Google Sheet et leurs colonnes (créés automatiquement)
@@ -59,7 +59,7 @@ function montrerLien() {
   const p = PropertiesService.getScriptProperties();
   const t = HtmlService.createTemplate(HTML_LIEN_);
   t.adresse = p.getProperty('ADRESSE_APPLI') || '';
-  t.exec = p.getProperty('ADRESSE_EXEC') || urlExec_();
+  t.exec = p.getProperty('ADRESSE_EXEC') || ''; // pas de pré-remplissage automatique : il pouvait proposer une mauvaise adresse
   t.profils = JSON.stringify(lire_('Profils').map(r => ({ id: r.id, nom: r.nom })));
   SpreadsheetApp.getUi().showModalDialog(t.evaluate().setWidth(520).setHeight(560), "Lien d'accès");
 }
@@ -105,7 +105,7 @@ const HTML_LIEN_ = `
 <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5">
   <p><b>1.</b> Adresse de l'appli sur GitHub Pages (ex. https://monbudget.github.io/le31/) :</p>
   <input id="a" style="width:100%;padding:6px;font-size:14px" value="<?= adresse ?>" placeholder="https://....github.io/le31/">
-  <p><b>2.</b> Adresse du script (URL de l'application Web, se termine par /exec) :</p>
+  <p><b>2.</b> Adresse du script : l'<b>URL de l'application Web</b> copiée au déploiement (se termine par /exec) :</p>
   <input id="x" style="width:100%;padding:6px;font-size:14px" value="<?= exec ?>" placeholder="https://script.google.com/macros/s/.../exec">
   <p><b>3.</b> Pour qui ?</p>
   <select id="p" style="width:100%;padding:6px;font-size:14px"></select>
@@ -137,16 +137,28 @@ const HTML_LIEN_ = `
 /* =================== Appli web (API) =================== */
 
 function doGet(e) {
+  try { return doGet_(e); } catch (err) { return json_({ ok: false, erreur: 'serveur', detail: String(err && err.message || err) }); }
+}
+function doPost(e) {
+  try { return doPost_(e); } catch (err) { return json_({ ok: false, erreur: 'serveur', detail: String(err && err.message || err) }); }
+}
+
+function doGet_(e) {
   const p = (e && e.parameter) || {};
   if (!p.action) return ContentService.createTextOutput('Le 31 : serveur actif (V' + VERSION_SERVEUR + ')');
+  if (p.action === 'ping') return json_({ ok: true, v: VERSION_SERVEUR });
   preparer_(false);
+  if (p.action === 'rejoindre') {
+    const verrou = LockService.getScriptLock(); verrou.waitLock(25000);
+    try { return json_(rejoindre_(p.inv, p.appareil)); } finally { verrou.releaseLock(); }
+  }
   const a = acces_(p.jeton);
   if (!a) return json_({ ok: false, erreur: 'acces' });
   if (p.action === 'tout') return json_({ ok: true, v: VERSION_SERVEUR, moi: a.profil, acces: a.id, data: tout_(a.profil) });
   return json_({ ok: false, erreur: 'action inconnue' });
 }
 
-function doPost(e) {
+function doPost_(e) {
   let c;
   try { c = JSON.parse(e.postData.contents); } catch (err) { return json_({ ok: false, erreur: 'json' }); }
   preparer_(false);

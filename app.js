@@ -2,7 +2,7 @@
    Données : Google Sheet via Google Apps Script. Lien d'accès à usage unique (#inv=CODE&api=URL /exec) échangé contre
    un jeton propre à l'appareil. Chacun voit le compte commun et son compte perso. config.js (apiUrl) facultatif. */
 'use strict';
-const APP_VERSION = '1.2';
+const APP_VERSION = '1.3';
 
 /* ================= Barème impôt (à mettre à jour chaque année) =================
    Barème 2026 sur les revenus 2025, par part. Plafond quotient familial : 1 807 € par demi-part.
@@ -67,31 +67,48 @@ const apiOk = () => API_RE.test(API() || '');
 const JETON = () => store.get('le31-jeton', '');
 const INV = () => store.get('le31-inv', '');
 let ME = store.get('le31-me', null);   // profil de cet appareil ('' = premier lancement pas terminé)
-let JOIN = { busy: false, err: '', iosOk: false };
+let JOIN = { busy: false, err: '', detail: '', iosOk: false };
 function deviceName() {
   const u = navigator.userAgent;
   return /iPad/.test(u) || (IOS && !/iPhone/.test(u)) ? 'iPad' : /iPhone/.test(u) ? 'iPhone' : /Android/.test(u) ? 'Android' : /Windows/.test(u) ? 'PC Windows' : /Mac/.test(u) ? 'Mac' : 'Appareil';
 }
+// fetch avec délai maximum : l'appli ne reste jamais bloquée en attente
+async function fetchT(url, opts, ms) {
+  const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const tm = setTimeout(() => ctl && ctl.abort(), ms || 25000);
+  try { return await fetch(url, Object.assign({}, opts, ctl ? { signal: ctl.signal } : {})); }
+  catch (e) { const x = new Error(e && e.name === 'AbortError' ? 'delai' : 'reseau'); x.net = true; throw x; }
+  finally { clearTimeout(tm); }
+}
+async function readJson(r) {
+  const txt = await r.text();
+  try { return JSON.parse(txt); } catch (e) { const x = new Error('html'); x.detail = txt.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160); throw x; }
+}
 async function api(body) {
-  const r = await fetch(API(), { method: 'POST', body: JSON.stringify(Object.assign({ jeton: JETON() }, body)) });
-  const j = await r.json();
-  if (!j.ok) throw new Error(j.erreur || 'erreur');
+  const r = await fetchT(API(), { method: 'POST', body: JSON.stringify(Object.assign({ jeton: JETON() }, body)) });
+  const j = await readJson(r);
+  if (!j.ok) { const x = new Error(j.erreur || 'erreur'); x.detail = j.detail; throw x; }
   return j;
 }
 async function join() {
   if (JOIN.busy || !INV() || !apiOk()) return;
   // Sur iPhone/iPad, l'appli installée ne voit pas ce que Safari a mémorisé : on attend qu'elle soit installée
   if (IOS && !STANDALONE() && !JOIN.iosOk) { render(); return; }
-  JOIN.busy = true; JOIN.err = ''; render();
+  JOIN.busy = true; JOIN.err = ''; JOIN.detail = ''; render();
   try {
-    const r = await fetch(API(), { method: 'POST', body: JSON.stringify({ action: 'rejoindre', inv: INV(), appareil: deviceName() }) });
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.erreur || 'erreur');
+    // connexion par GET (le chemin le plus simple et le plus fiable), POST pour un serveur plus ancien
+    let j = await readJson(await fetchT(API() + '?action=rejoindre&inv=' + encodeURIComponent(INV()) + '&appareil=' + encodeURIComponent(deviceName()) + '&t=' + Date.now()));
+    if (!j.ok && j.erreur === 'acces') j = await readJson(await fetchT(API(), { method: 'POST', body: JSON.stringify({ action: 'rejoindre', inv: INV(), appareil: deviceName() }) }));
+    if (!j.ok) { const x = new Error(j.erreur || 'erreur'); x.detail = j.detail; throw x; }
     store.set('le31-inv-faite', INV()); store.set('le31-inv', '');
     store.set('le31-jeton', j.jeton); store.set('le31-acces', j.acces); QUEUE = []; store.set('le31-file', []);
     RAW = null; LOADED = false; SYNC.error = '';
     received(j.data, j.moi);
-  } catch (e) { const net = e instanceof TypeError; JOIN.err = net ? 'reseau' : String(e.message || e); if (!net) store.set('le31-inv', ''); }
+  } catch (e) {
+    const m = String(e.message || e), keep = e.net || m === 'html' || m === 'serveur' || m === 'reseau';
+    JOIN.err = m; JOIN.detail = e.detail || '';
+    if (!keep) store.set('le31-inv', ''); // lien refusé pour de bon (déjà utilisé, expiré…)
+  }
   JOIN.busy = false; render();
 }
 
@@ -159,8 +176,8 @@ async function pull() {
   if (QUEUE.length) return flush();
   pulling = true;
   try {
-    const r = await fetch(API() + '?action=tout&jeton=' + encodeURIComponent(JETON()) + '&t=' + Date.now());
-    const j = await r.json();
+    const r = await fetchT(API() + '?action=tout&jeton=' + encodeURIComponent(JETON()) + '&t=' + Date.now());
+    const j = await readJson(r);
     if (!j.ok) throw new Error(j.erreur || 'erreur');
     if (j.acces) store.set('le31-acces', j.acces);
     if (!QUEUE.length) received(j.data, j.moi);
@@ -431,6 +448,20 @@ function gate() {
     if (IOS && !STANDALONE() && !JOIN.iosOk) return `<section class="view center">${logo}<h2>Installe d'abord Le 31</h2>
       <p class="hint" style="font-size:14px">Sur iPhone et iPad : bouton <b>Partager</b> puis <b>Sur l'écran d'accueil</b>. Ouvre ensuite Le 31 depuis l'écran d'accueil : si l'appli te le demande, colle le lien reçu.</p>
       <p class="hint">Ce lien ne marche qu'une fois, sur un seul appareil.</p><button class="btn ghost" data-iosok="1">Utiliser Le 31 dans Safari plutôt</button></section>`;
+    const E = JOIN.err;
+    if (!JOIN.busy && E) {
+      const api = API(), short = api.replace(/^https:\/\/script\.google\.com\/macros\/s\/(.{6}).*(.{6})\/exec$/, '…/s/$1…$2/exec');
+      const why = E === 'delai' ? "Le serveur n'a pas répondu à temps."
+        : E === 'reseau' ? "Impossible de joindre le serveur (réseau, ou adresse du serveur incorrecte dans le lien)."
+        : E === 'html' ? "L'adresse du serveur contenue dans le lien ne répond pas comme prévu : ce n'est sans doute pas la bonne (ou le déploiement n'est pas en « Tout le monde »)."
+        : E === 'serveur' ? 'Le serveur a rencontré une erreur.' : 'Erreur : ' + esc(E);
+      return `<section class="view center">${logo}<h2>Connexion impossible</h2>
+        <p class="hint" style="font-size:14px">${why}</p>
+        ${JOIN.detail ? `<div class="note" style="text-align:left;font-size:12px;word-break:break-word">Détail : ${esc(JOIN.detail)}</div>` : ''}
+        <div class="note" style="text-align:left;font-size:13px">Adresse du serveur dans ton lien :<br><b style="word-break:break-all">${esc(short)}</b><br>Elle doit être identique à l'<b>URL de l'application Web</b> du déploiement. Ouverte dans Safari, elle doit afficher « Le 31 : serveur actif ». Sinon, recrée le lien depuis le menu « Le 31 » du Google Sheet en collant la bonne adresse.</div>
+        <button class="btn" data-joinretry="1">Réessayer</button>
+        ${paste}</section>`;
+    }
     return `<section class="view center">${logo}<p class="hint">Connexion de cet appareil…</p></section>`;
   }
   if (!JETON() || !apiOk() || isAccessErr(SYNC.error)) {
@@ -1185,6 +1216,7 @@ document.addEventListener('click', ev => {
   if (ds.taxmode) { commit([upd('Parametres', { cle: 'impMode', valeur: ds.taxmode })]); return; }
   if (ds.syncnow) { QUEUE.length ? flush() : pull(); toast('Synchronisation lancée'); return; }
   if (ds.iosok) { JOIN.iosOk = true; join(); return; }
+  if (ds.joinretry) { JOIN.err = ''; join(); return; }
   if (ds.onbmode) { ONB.mode = ds.onbmode; render(); return; }
   if (ds.onbstep) {
     const P = $('onbP'); if (P) ONB.partner = P.value.trim();
