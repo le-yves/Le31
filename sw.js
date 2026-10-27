@@ -1,6 +1,6 @@
 // LE 31 — service worker (fonctionnement hors ligne + mises à jour automatiques)
 // À CHAQUE LIVRAISON : changer VERSION pour que les téléphones prennent la nouvelle version.
-const VERSION = 'le31-v1.3';
+const VERSION = 'le31-v1.4';
 const FICHIERS = ['./', 'index.html', 'style.css', 'app.js', 'config.js', 'manifest.json', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

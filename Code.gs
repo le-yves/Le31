@@ -1,13 +1,13 @@
 /**
  * LE 31 — serveur (Google Apps Script lié au Google Sheet « Le 31 »)
- * Version 1.3 : connexion d'un appareil par GET (plus robuste), erreurs toujours renvoyées en JSON.
+ * Version 1.4 : règles d'import par compte (nom, catégorie, type), invisibles pour l'autre personne.
  *
  * À coller dans : Google Sheet > Extensions > Apps Script (remplacer tout le contenu).
  * Ensuite : exécuter une fois la fonction « installer », puis Déployer > Nouveau déploiement > Application Web.
  * Voir le tuto d'installation (iPad ou PC).
  */
 
-const VERSION_SERVEUR = '1.3';
+const VERSION_SERVEUR = '1.4';
 const VALIDITE_LIEN_JOURS = 14;
 
 // Onglets du Google Sheet et leurs colonnes (créés automatiquement)
@@ -21,7 +21,7 @@ const ONGLETS = {
   Pointages:   ['id', 'compte', 'mois', 'cle', 'montantReel'],
   Clotures:    ['id', 'compte', 'mois', 'soldeFin', 'dateCloture'],
   Simulations: ['id', 'compte', 'libelle', 'montant', 'mois', 'actif'],
-  Regles:      ['id', 'motif', 'categorie'],
+  Regles:      ['id', 'motif', 'categorie', 'compte', 'nom', 'type'],
   Parametres:  ['cle', 'valeur'],
   Acces:       ['id', 'jeton', 'profil', 'appareil', 'cree', 'vu', 'actif'],
   Invitations: ['code', 'profil', 'cree', 'utilise', 'par']
@@ -247,6 +247,7 @@ function tout_(moi) {
     let rows = lire_(nom);
     if (nom === 'Comptes') rows = rows.filter(r => vis.indexOf(r.id) >= 0);
     else if (nom === 'Virements') rows = rows.filter(r => vis.indexOf(r.de) >= 0 || vis.indexOf(r.vers) >= 0);
+    else if (nom === 'Regles') rows = rows.filter(r => !r.compte || vis.indexOf(r.compte) >= 0); // noms appris d'un perso : privés
     else if (nom === 'Pointages') rows = rows.filter(r => vis.indexOf(r.compte) >= 0 || virVis.indexOf(String(r.cle)) >= 0);
     else if (PAR_COMPTE.indexOf(nom) >= 0) rows = rows.filter(r => vis.indexOf(r.compte) >= 0);
     out[nom] = rows;
@@ -298,6 +299,7 @@ function autorise_(nom, ancien, futur, vis, moi) {
   if (nom === 'Virements') return [ancien, futur].every(r => !r || ok(r.de) || ok(r.vers));
   if (nom === 'Pointages') return [ancien, futur].every(r => !r || ok(r.compte) || virOk_(r.cle, vis));
   if (PAR_COMPTE.indexOf(nom) >= 0) return [ancien, futur].every(r => !r || ok(r.compte));
+  if (nom === 'Regles') return [ancien, futur].every(r => !r || !r.compte || ok(r.compte));
   return true; // Profils, Regles, Parametres : communs au foyer
 }
 
