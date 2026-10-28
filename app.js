@@ -2,7 +2,7 @@
    Données : Google Sheet via Google Apps Script. Lien d'accès à usage unique (#inv=CODE&api=URL /exec) échangé contre
    un jeton propre à l'appareil. Chacun voit le compte commun et son compte perso. config.js (apiUrl) facultatif. */
 'use strict';
-const APP_VERSION = '1.5';
+const APP_VERSION = '2.1';
 
 /* ================= Barème impôt (à mettre à jour chaque année) =================
    Barème 2026 sur les revenus 2025, par part. Plafond quotient familial : 1 807 € par demi-part.
@@ -114,7 +114,7 @@ async function join() {
 }
 
 /* ================= Données ================= */
-const TABS = { comptes: 'Comptes', profils: 'Profils', categories: 'Categories', fixes: 'Fixes', virements: 'Virements', operations: 'Operations', pointages: 'Pointages', clotures: 'Clotures', simulations: 'Simulations', regles: 'Regles', parametres: 'Parametres', appareils: 'Appareils', attente: 'Attente' };
+const TABS = { comptes: 'Comptes', profils: 'Profils', categories: 'Categories', fixes: 'Fixes', virements: 'Virements', operations: 'Operations', pointages: 'Pointages', clotures: 'Clotures', simulations: 'Simulations', regles: 'Regles', parametres: 'Parametres', appareils: 'Appareils', attente: 'Attente', banque: 'Banque', banqueConf: 'BanqueConf' };
 const EMPTY = () => { const o = {}; for (const k in TABS) o[k] = []; return o; };
 let RAW = store.get('le31-data', null);          // dernière copie reçue du serveur
 let QUEUE = store.get('le31-file', []);          // modifications pas encore envoyées
@@ -197,6 +197,7 @@ function received(data, moi) {
   const first = !LOADED; LOADED = true;
   rebuild(); setSync();
   ensurePerso();
+  setTimeout(bankAuto, 0);
   if (first || before !== JSON.stringify(RAW) + ME) {
     // ne pas re-dessiner pendant qu'on tape dans un champ
     const a = document.activeElement;
@@ -488,17 +489,18 @@ function render() {
   const L = $('monthLbl'); if (L) L.textContent = mLabel(CUR);
   $('foot').textContent = 'Le 31 · V' + APP_VERSION;
   document.querySelectorAll('nav.tabs button, #gearBtn').forEach(b => b.setAttribute('aria-current', b.dataset.tab === UI.tab));
-  const blocked = gate(), imp = !blocked && UI.imp && IMP;
-  $('tabs').hidden = !!blocked || !!imp; $('gearBtn').hidden = !!blocked || !!imp;
+  const blocked = BK.view === 'retour' ? null : gate(), imp = !blocked && UI.imp && IMP;
+  const bkv = !blocked && !imp && (BK.view || (bkPend() ? 'map' : null));
+  $('tabs').hidden = !!blocked || !!imp || !!bkv; $('gearBtn').hidden = !!blocked || !!imp || !!bkv;
   $('top').querySelector('.seg').hidden = !!blocked || !!imp || accs().length < 2 || (UI.tab === 'fore' && UI.foreTab === 'tax') || UI.tab === 'set';
   $('accSeg').innerHTML = accs().map(a => `<button data-acc="${esc(a.id)}" aria-pressed="${a.id === UI.acc}">${esc(a.nom)}</button>`).join('');
   try {
-    main.innerHTML = blocked || (imp ? vImport() : ({ home: vHome, fixed: vFixed, add: vAdd, ponct: vPonct, bilan: vBilan, fore: vFore, set: vSet }[UI.tab] || vHome)());
+    main.innerHTML = blocked || (imp ? vImport() : bkv ? vBank() : ({ home: vHome, fixed: vFixed, add: vAdd, ponct: vPonct, bilan: vBilan, fore: vFore, set: vSet }[UI.tab] || vHome)());
   } catch (e) {
     console.error(e);
     main.innerHTML = `<section class="view"><div class="note bad">Un problème d'affichage est survenu : ${esc(e.message)}. Va dans Réglages ou recharge l'appli.</div></section>`;
   }
-  setSync();
+  setSync(); bankChip();
 }
 // Écrans bloquants : appli pas encore reliée, lien refusé, accès coupé, premier chargement, premier lancement
 function gate() {
@@ -617,7 +619,7 @@ function vHome() {
 
 // Bandeaux : serveur à mettre à jour, doublons virement lié / rentrée fixe, compte importé avant la V1.4
 function banners(acc) {
-  let h = '';
+  let h = bankBanners(acc);
   if (SYNC.v && SYNC.v < '1.4') h += `<div class="banner warn"><span>Serveur en V${esc(SYNC.v)} : mets à jour <b>Code.gs</b> (Apps Script, nouvelle version) pour garder les noms et catégories appris.</span></div>`;
   DB.virements.filter(v => v.vers === acc && bool(v.actif)).forEach(v => { const f = dupFixeFor(v); if (f) h += `<div class="banner warn"><span>« <b>${esc(f.libelle)}</b> » fait doublon avec le virement lié « ${esc(v.libelle)} » : compté deux fois.</span><button class="btn small" data-dupfix="${esc(f.id)}" data-dupvir="${esc(v.id)}">Corriger</button></div>`; });
   if (DB.operations.some(o => o.compte === acc && o.ref) && !param('imp14|' + acc, '') && !store.get('le31-noreimp|' + acc, false))
@@ -626,10 +628,12 @@ function banners(acc) {
 }
 
 /* ----- Onglet Ponctuel : toutes les opérations, mois par mois ----- */
-const P = { k: null, q: '', f: 'tout', cat: '' };
+const P = { k: null, q: '', f: 'tout', cat: '', view: store.get('le31-pview', 'ponct') };
 function vPonct() {
   const acc = UI.acc;
   if (!started(acc)) return `<section class="view"><div class="note">Démarre d'abord le compte dans l'onglet Mois (import d'un relevé ou solde à la main).</div></section>`;
+  const vseg = `<div class="seg" role="group" aria-label="Vue"><button data-pview="ponct" aria-pressed="${P.view !== 'releve'}">Ponctuel</button><button data-pview="releve" aria-pressed="${P.view === 'releve'}">Relevé complet</button></div>`;
+  if (P.view === 'releve') return vReleve(vseg);
   const k0 = startMonth(acc), lastOp = DB.operations.filter(o => o.compte === acc).reduce((m, o) => String(o.date).slice(0, 7) > m ? String(o.date).slice(0, 7) : m, CUR);
   if (!P.k || P.k < k0) P.k = CUR;
   const q = NORM(P.q.trim()), all = DB.operations.filter(o => o.compte === acc);
@@ -644,7 +648,7 @@ function vPonct() {
   const head = g => q ? mLabel(g) : (+g.slice(8, 10)) + ' ' + MONTHS_L[pm(g.slice(0, 7)).m];
   const row = o => { const v = num(o.montant) || 0, tg = o.type === 'exc' ? '<span class="tag w">exceptionnel</span>' : o.type === 'int' ? '<span class="tag g">entre mes comptes</span>' : o.type === 'vir' ? '<span class="tag">lié</span>' : '';
     return `<button class="item" data-oid="${esc(o.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(nameOf(o))}${tg}</b><small>${o.type === 'ajust' ? 'Correction de solde' : o.categorie ? catHtml(o.categorie) : '<span style="color:var(--warn);font-weight:700">À classer</span>'}${q ? ' · ' + (+String(o.date).slice(8, 10)) + ' ' + MONTHS[pm(String(o.date).slice(0, 7)).m] + ' ' + String(o.date).slice(2, 4) : ''}${o.profil && DB.profils.length > 1 && o.profil !== ME ? ' · ' + esc(pname(o.profil)) : ''}</small></span><span class="amt ${v > 0 ? 'pos' : 'neg'}">${sgn(v)}</span></button>`; };
-  return `<section class="view">
+  return `<section class="view">${vseg}
     ${q ? `<div class="rowhead"><h2>${list.length} résultat${list.length > 1 ? 's' : ''}</h2><span class="sub">tous les mois</span></div>` : `<div class="mnav"><button data-pm="-1" aria-label="Mois précédent" ${P.k <= k0 ? 'disabled' : ''}>‹</button><b>${mLabel(P.k)}</b><button data-pm="1" aria-label="Mois suivant" ${P.k >= lastOp ? 'disabled' : ''}>›</button></div>
     <div class="hero" style="gap:8px"><div class="rowhead"><span class="sub">Dépenses ponctuelles${P.k === CUR ? ' à ce jour' : ''}</span>${P.k <= CUR ? pill : ''}</div>
       <div class="big num" style="font-size:34px">${eur0(spent)}</div>
@@ -658,6 +662,39 @@ function vPonct() {
   </section>`;
 }
 
+
+/* ----- Relevé complet : toutes les entrées et sorties du mois, comme sur le relevé de la banque, avec le solde après chaque ligne ----- */
+function vReleve(vseg) {
+  const acc = UI.acc, k0 = startMonth(acc);
+  if (!P.k || P.k < k0) P.k = CUR;
+  const k = P.k, start = startOf(acc, k), r = calc(acc, k, start);
+  const passed = r.ev.filter(e => e.kind !== 'sim' && !e.late && e.d <= (k < CUR ? r.D : k === CUR ? r.T : 0)), todo = r.ev.filter(e => e.kind !== 'sim' && !passed.includes(e));
+  const ord = (a, b) => a.d - b.d || (b.v > 0) - (a.v > 0);
+  let s = start; const rows = passed.slice().sort(ord).map(e => { s += e.v; return { e, s }; });
+  const inn = passed.filter(e => e.v > 0).reduce((x, e) => x + e.v, 0), out = -passed.filter(e => e.v < 0).reduce((x, e) => x + e.v, 0);
+  const bk = bkRow(acc), bkS = bk && bk.solde !== '' ? num(bk.solde) : null, gap = bkS !== null && k === CUR ? r2(r.bal - bkS) : null;
+  // doublons possibles : même jour, même montant
+  const seen = {}; passed.forEach(e => { const kk = e.d + '|' + r2(e.v); seen[kk] = (seen[kk] || 0) + 1; });
+  const line = (e, sAfter, fut) => {
+    const attr = e.kind === 'fixe' ? `data-fid="${esc(e.id)}"` : e.kind === 'vir' ? `data-vid="${esc(e.id)}"` : `data-oid="${esc(e.id)}"`;
+    const tag = e.kind === 'fixe' ? `<span class="tag ${e.ok ? 'ok' : ''}">fixe${e.ok ? ' ✓' : ''}</span>` : e.kind === 'vir' || e.kind === 'virop' ? '<span class="tag">lié</span>' : e.kind === 'ajust' ? '<span class="tag w">correction</span>' : e.x === 'exc' ? '<span class="tag w">exceptionnel</span>' : e.x === 'int' ? '<span class="tag g">entre mes comptes</span>' : '';
+    const dbl = !fut && seen[e.d + '|' + r2(e.v)] > 1 ? '<span class="tag w">même jour, même montant</span>' : '';
+    const sub = fut ? (e.late ? 'date passée, pas encore vue sur le compte' : 'prévu') : e.kind === 'ajust' ? 'écart corrigé pour coller au solde réel' : e.kind === 'fixe' || e.kind === 'vir' ? (e.ok ? 'vu sur le compte' : 'prévu, pas pointé') : (e.cat ? esc(e.cat) : 'À classer');
+    return `<button class="item rl2" ${attr} style="grid-template-columns:34px 1fr auto"><span class="day">${e.d}</span><span class="lbl"><b>${esc(e.label || '')}${tag}${dbl}</b><small>${sub}</small></span><span class="amt ${e.v > 0 ? 'pos' : 'neg'}">${sgn(e.v)}${sAfter != null ? `<small>solde ${eur(r2(sAfter))}</small>` : ''}</span></button>`;
+  };
+  return `<section class="view">${vseg}
+    <div class="mnav"><button data-pm="-1" aria-label="Mois précédent" ${k <= k0 ? 'disabled' : ''}>‹</button><b>${mLabel(k)}</b><button data-pm="1" aria-label="Mois suivant" ${k >= CUR ? 'disabled' : ''}>›</button></div>
+    <div class="hero" style="gap:10px">
+      <div class="kv"><div><small>Solde au 1er</small><b>${eur(r2(start))}</b></div><div><small>${k === CUR ? 'Solde aujourd\'hui' : 'Solde fin de mois'}</small><b>${eur(r2(s))}</b></div></div>
+      <div class="kv"><div><small>Entrées</small><b class="pos">+${eur(r2(inn))}</b></div><div><small>Sorties</small><b>−${eur(r2(out))}</b></div></div>
+      ${gap !== null ? (Math.abs(gap) >= 1 ? `<div class="note warn"><b>Écart avec la banque : ${sgn(gap)}</b> (banque : ${eur(bkS)}, lu ${esc(bkTime(acc))}). Cherche une ligne en double ou en trop ci-dessous (repère « même jour, même montant » ou « correction ») : touche-la pour la corriger ou la supprimer.</div>` : `<div class="note good">Identique au solde de la banque (${eur(bkS)}, lu ${esc(bkTime(acc))}).</div>`) : ''}
+    </div>
+    ${todo.length ? `<div class="dayhead">À venir d'ici le ${r.D}</div><div class="list">${todo.slice().sort(ord).map(e => line(e, null, true)).join('')}</div>` : ''}
+    <div class="dayhead">Passé · du plus récent au plus ancien</div>
+    <div class="list">${rows.length ? rows.slice().reverse().map(x => line(x.e, x.s)).join('') : '<div class="empty">Aucun mouvement ce mois-ci.</div>'}</div>
+    <div class="hint">Toutes les lignes du mois : charges fixes (✓ = vues sur le compte), virements liés, dépenses et rentrées ponctuelles, corrections de solde. Le solde après chaque ligne se compare au relevé de la banque.</div>
+  </section>`;
+}
 
 /* ----- Onglet Bilan : évolution mois par mois des thèmes choisis ----- */
 const BIL = { n: store.get('le31-bil-n', 12), mode: store.get('le31-bil-mode', 'barres'), exc: false, sel: null, table: false };
@@ -964,6 +1001,7 @@ function vSet() {
       <label class="switch" for="th-dark" style="${UI.theme === 'auto' ? 'opacity:.45' : ''}"><span>Mode sombre</span><input type="checkbox" id="th-dark" data-theme-dark="1" ${dark ? 'checked' : ''} ${UI.theme === 'auto' ? 'disabled' : ''}></label>
       <div class="hint">${UI.theme === 'auto' ? "L'appli passe en sombre quand le téléphone l'est." : 'Choix forcé, quel que soit le réglage du téléphone.'} Réglage propre à ce téléphone.</div>
     </div>
+    ${vBankSet()}
     ${accs().map(accBlock).join('')}
     ${vProfiles()}
     <div class="hero" style="gap:8px"><div class="rowhead"><h2>Synchronisation</h2><span class="pill ${SYNC.state === 'ok' ? 'good' : SYNC.state === 'err' ? 'bad' : 'warn'}">${syncTxt}</span></div>
@@ -1042,7 +1080,7 @@ const NOMS = [
   [/PICARD/, 'Picard', 'Courses'], [/BIOCOOP/, 'Biocoop', 'Courses'], [/MONOPRIX/, 'Monoprix', 'Courses'], [/FRANPRIX/, 'Franprix', 'Courses'], [/NETTO/, 'Netto', 'Courses'],
   [/BRICO ?DEPOT/, 'Brico Dépôt', 'Maison'], [/CASTORAMA/, 'Castorama', 'Maison'], [/LEROY ?MERLIN/, 'Leroy Merlin', 'Maison'], [/\bIKEA\b/, 'Ikea', 'Maison'],
   [/BRICOMARCHE/, 'Bricomarché', 'Maison'], [/WELDOM/, 'Weldom', 'Maison'], [/JARDILAND/, 'Jardiland', 'Maison'], [/GAMM VERT/, 'Gamm Vert', 'Maison'],
-  [/ELECTRO ?DEPOT/, 'Electro Dépôt', 'Shopping'], [/BOULANGER/, 'Boulanger', 'Shopping'], [/DARTY/, 'Darty', 'Shopping'], [/\bFNAC\b/, 'Fnac', 'Shopping'],
+  [/ELECTRO ?DEPOT/, 'Electro Dépôt', 'Shopping'], [/\bBOULANGER\b/, 'Boulanger', 'Shopping'], [/DARTY/, 'Darty', 'Shopping'], [/\bFNAC\b/, 'Fnac', 'Shopping'],
   [/DECATHLON/, 'Decathlon', 'Shopping'], [/LEBONCOIN/, 'Leboncoin', 'Shopping'], [/CDISCOUNT/, 'Cdiscount', 'Shopping'], [/ALIEXPRESS/, 'AliExpress', 'Shopping'],
   [/VINTED/, 'Vinted', 'Shopping'], [/SHEIN/, 'Shein', 'Shopping'], [/\bTEMU\b/, 'Temu', 'Shopping'], [/KIABI/, 'Kiabi', 'Shopping'], [/PRIMARK/, 'Primark', 'Shopping'],
   [/ACTION LOGEMENT/, 'Action Logement', 'Crédits', 'Revenus'], [/\bACTION\b/, 'Action', 'Shopping'],
@@ -1225,7 +1263,9 @@ function matchFixed(t, acc, used) {
   const ok = f => Math.abs((num(f.montant) || 0) - a) <= Math.max(0.5 * (num(f.montant) || 0), 20); // même libellé : montant du même ordre
   const best = list => list.sort((x, y) => Math.abs((num(x.montant) || 0) - a) - Math.abs((num(y.montant) || 0) - a))[0];
   const fx = DB.fixes.filter(f => f.compte === acc && occursF(f, k) && (f.sens === '+') !== neg && free('f' + f.id));
-  const f = best(fx.filter(f => same(f.motif) && ok(f))) || best(fx.filter(f => !f.motif && near(f.montant, f.jour)));
+  // banque : le libellé peut différer de celui des relevés ; on accepte alors une charge au montant très proche, à la bonne date
+  const bankNear = f => t.bank && Math.abs((num(f.montant) || 0) - a) <= Math.max(0.1 * (num(f.montant) || 0), 2) && dayGap(num(f.jour) || 1, d) <= 4;
+  const f = best(fx.filter(f => same(f.motif) && ok(f))) || best(fx.filter(f => !f.motif && near(f.montant, f.jour))) || best(fx.filter(bankNear));
   if (f) return 'f' + f.id;
   const vx = DB.virements.filter(v => occursV(v, k) && ((v.de === acc && neg) || (v.vers === acc && !neg)) && free('v' + v.id));
   const v = best(vx.filter(v => v.motif && v.de === acc && same(v.motif) && ok(v))) || best(vx.filter(v => !(v.motif && v.de === acc) && near(v.montant, v.jour)));
@@ -1297,14 +1337,14 @@ function resetOps(acc) {
   ops.push(upd('Comptes', { id: acc, soldeDepart: '', moisDepart: '' }));
   return ops;
 }
-function startImport(parsed, mode) {
-  const acc = UI.acc;
+function startImport(parsed, mode, opt) {
+  opt = opt || {}; const acc = opt.acc || UI.acc;
   if (started(acc) && !mode) { IMP = { acc, parsed, step: 'choice' }; UI.imp = 'go'; render(); scrollTo(0, 0); return; }
   if (mode === 'reset') commit(resetOps(acc));
   const first = !started(acc), used = new Set();
   const tx = parsed.tx.slice().sort((a, b) => a.date.localeCompare(b.date));
   const seen = {};
-  tx.forEach(t => { t.motif = motifOf(t.libelle); t.key = keyOf(t.libelle); t.ref = refOf(t); seen[t.ref] = (seen[t.ref] || 0) + 1; if (seen[t.ref] > 1) t.ref += '#' + seen[t.ref]; });
+  tx.forEach(t => { t.bank = parsed.format === 'Banque'; t.motif = motifOf(t.libelle); t.key = keyOf(t.libelle); t.ref = (t.bank ? 'bk|' : '') + refOf(t); seen[t.ref] = (seen[t.ref] || 0) + 1; if (seen[t.ref] > 1) t.ref += '#' + seen[t.ref]; });
   const I = { acc, first, parsed, tx, recur: [], keep: {}, virOn: {}, gname: {}, gcat: {}, gtouch: {}, kind: {}, newCats: [], gshow: 30, solde: parsed.solde, recal: true, reset: mode === 'reset' };
   if (first) {
     const m0 = tx[0].date.slice(0, 7), mL = tx[tx.length - 1].date.slice(0, 7);
@@ -1314,14 +1354,17 @@ function startImport(parsed, mode) {
   // déjà connus : prélèvements fixes / virements liés, opérations déjà importées ou saisies à la main
   const refs = new Set(DB.operations.filter(o => o.compte === acc && o.ref).map(o => o.ref));
   const manual = DB.operations.filter(o => o.compte === acc && !o.ref && o.type !== 'ajust');
+  // banque : une opération déjà importée d'un relevé (même jour, même montant) peut avoir un libellé un peu différent
+  const dayAmt = {}; if (parsed.format === 'Banque') DB.operations.filter(o => o.compte === acc && o.ref && !String(o.ref).startsWith('bk|')).forEach(o => { const k = o.date + '|' + r2(num(o.montant)); dayAmt[k] = (dayAmt[k] || 0) + 1; });
   I.kept.forEach(t => {
     if (refs.has(t.ref)) { t.dup = true; return; }
+    const da = t.date + '|' + r2(t.montant); if (dayAmt[da]) { dayAmt[da]--; t.dup = true; return; }
     const m = matchFixed(t, acc, used);
     if (m) { used.add(t.date.slice(0, 7) + '|' + m); if (point(t.date.slice(0, 7), m)) t.dup = true; else t.match = m; return; } // déjà pointé = déjà compté
     const mo = manual.find(o => Math.abs((num(o.montant) || 0) - t.montant) < 0.01 && Math.abs(new Date(o.date) - new Date(t.date)) <= 4 * 864e5);
     if (mo) { t.same = mo.id; manual.splice(manual.indexOf(mo), 1); }
   });
-  if (first) { I.recur = detectRecurring(tx.filter(t => !t.match), acc); I.recur.forEach(r => { I.keep[r.id] = true; if (r.vir) I.virOn[r.id] = true; }); }
+  if (first) { I.recur = detectRecurring(tx.filter(t => !t.match && !t.dup), acc); /* déjà pointé (virement lié importé de l'autre côté) : pas une nouvelle charge */ I.recur.forEach(r => { I.keep[r.id] = true; if (r.vir) I.virOn[r.id] = true; }); }
   // gros mouvements et virements entre ses comptes
   impRest(I).forEach(t => {
     const r = ruleOf(acc, t.libelle, t.montant), a = Math.abs(t.montant);
@@ -1331,6 +1374,7 @@ function startImport(parsed, mode) {
   });
   I.steps = [first && I.recur.length ? 'recur' : '', 'big', 'groups', first ? 'solde' : ''].filter(Boolean);
   I.step = I.steps[0];
+  if (opt.silent) return I;
   IMP = I; UI.imp = 'go'; render(); scrollTo(0, 0);
 }
 // opérations à créer (hors prélèvements reconnus et doublons)
@@ -1430,8 +1474,10 @@ function soldeDelta(I) {
   const d = I.solde.date, k = d.slice(0, 7);
   if (k < startMonth(I.acc) || k > CUR) return { delta: 0 };
   const r = calc(I.acc, k, startOf(I.acc, k)), day = Math.min(+d.slice(8, 10), r.D);
-  const rest = impRest(I).filter(t => t.date <= d).reduce((a, t) => a + t.montant, 0);
-  const ptsDiff = I.kept.filter(t => t.match && t.date <= d).reduce((a, t) => { const ev = r.ev.find(e => e.key === t.match); return a + (ev && ev.d <= day ? t.montant - ev.v : 0); }, 0);
+  // nouvelles opérations : celles du mois, et celles d'un mois passé pas encore clôturé
+  const rest = impRest(I).filter(t => t.date <= d && (t.date.slice(0, 7) === k || !clot(I.acc, t.date.slice(0, 7)))).reduce((a, t) => a + t.montant, 0);
+  // charge fixe reconnue : la courbe compte déjà son montant prévu seulement si elle y figure (pas « en retard », date passée)
+  const ptsDiff = I.kept.filter(t => t.match && t.date <= d && t.date.slice(0, 7) === k).reduce((a, t) => { const ev = r.ev.find(e => e.key === t.match), inCurve = ev && !ev.late && ev.d <= day; return a + t.montant - (inCurve ? ev.v : 0); }, 0);
   return { delta: I.solde.montant - (r.curve[day - 1] + rest + ptsDiff) };
 }
 // Règle apprise (nom, catégorie, type) pour un marchand de ce compte
@@ -1444,8 +1490,8 @@ function dupFixeFor(v) {
   const a = num(v.montant) || 0, j = num(v.jour) || 1;
   return DB.fixes.find(f => f.compte === v.vers && f.sens === '+' && bool(f.actif) && Math.abs((num(f.montant) || 0) - a) <= Math.max(2, a * 0.02) && dayGap(num(f.jour) || 1, j) <= 5);
 }
-function commitImport() {
-  const I = IMP, acc = I.acc, ops = [], pts = {}, res = { ops: 0, fixes: 0, pts: 0, clos: 0, exc: 0, nc: 0, dbl: 0 };
+function commitImport(I0, silent) {
+  const I = I0 || IMP, acc = I.acc, ops = [], pts = {}, res = { ops: 0, fixes: 0, pts: 0, clos: 0, exc: 0, nc: 0, dbl: 0 };
   const addPt = (t, cle) => { const k = t.date.slice(0, 7), id = k + '|' + cle; if (!pts[id]) pts[id] = { id, compte: acc, mois: k, cle, montantReel: 0 }; pts[id].montantReel = r2(pts[id].montantReel + Math.abs(t.montant)); };
   I.kept.filter(t => t.match).forEach(t => addPt(t, t.match));
   I.kept.filter(t => t.same).forEach(t => ops.push(upd('Operations', { id: t.same, ref: t.ref })));
@@ -1490,10 +1536,185 @@ function commitImport() {
   ops.push(upd('Parametres', { cle: 'imp14|' + acc, valeur: TODAY_ISO }));
   const recal = !I.first && I.solde && I.recal ? r2(soldeDelta(I).delta) : 0;
   commit(ops);
-  if (Math.abs(recal) >= 1) { commit([upd('Operations', { id: uid(), compte: acc, date: I.solde.date, montant: recal, categorie: 'Correction de solde', libelle: 'Correction (relevé importé)', profil: ME, type: 'ajust', lien: '', ref: '' })]); res.recal = recal; }
+  if (Math.abs(recal) >= 1) { commit([upd('Operations', { id: uid(), compte: acc, date: I.solde.date, montant: recal, categorie: 'Correction de solde', libelle: I.parsed.format === 'Banque' ? 'Correction (solde de la banque)' : 'Correction (relevé importé)', profil: ME, type: 'ajust', lien: '', ref: '' })]); res.recal = recal; }
+  if (silent) return res;
   I.result = res; I.step = 'done'; I.steps = null; render(); scrollTo(0, 0);
 }
 
+
+
+/* ================= V2 : connexion bancaire ================= */
+const BK = { busy: false, last: store.get('le31-bk-last', 0), res: null, err: {}, view: null, acc: null, q: '', list: null, sel: {}, mode: {}, queue: [], auto: store.get('le31-bk-auto', true), msg: '' };
+const bkConf = () => DB.banqueConf[0] || {};
+const bkOn = () => bkConf().ok === 'oui';
+const bkRow = acc => DB.banque.find(r => r.compte === acc && r.actif === 'oui');
+const bkLinked = () => accs().filter(a => bkRow(a.id)).map(a => a.id);
+function bkPend() { try { return JSON.parse(bkConf().attente || 'null'); } catch (e) { return null; } }
+const bkDays = r => r && r.jusqua ? Math.floor((new Date(r.jusqua) - Date.now()) / 864e5) : 999;
+const isoAdd = (iso, n) => { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const lastRefDate = acc => DB.operations.filter(o => o.compte === acc && o.ref).reduce((m, o) => String(o.date) > m ? String(o.date) : m, '');
+
+// Lecture de la banque : silencieuse pour un compte déjà démarré, import guidé pour un compte neuf ou « tout reconstruire »
+async function bankSync(o) {
+  o = o || {};
+  if (BK.busy || !bkOn() || !JETON()) return;
+  const linked = bkLinked(); if (!linked.length) return;
+  BK.busy = true; BK.msg = ''; render();
+  const depuis = {}, first = o.first || {}, P = [];
+  linked.forEach(acc => {
+    const b0 = param('bk0|' + acc, '');
+    if (first[acc] === 'refaire' || !started(acc)) depuis[acc] = isoAdd(TODAY_ISO, -400); // la banque fournit ce qu'elle peut (souvent 90 j à 13 mois)
+    else if (first[acc] === 'reprendre' || !b0) depuis[acc] = lastRefDate(acc) || isoAdd(TODAY_ISO, -60); // dès le jour du dernier import : les opérations déjà là sont reconnues
+    else depuis[acc] = [b0, lastRefDate(acc) ? isoAdd(lastRefDate(acc), -10) : b0].sort().pop(); // 10 jours de recouvrement : les doublons sont ignorés
+    if (!b0 || first[acc]) P.push(upd('Parametres', { cle: 'bk0|' + acc, valeur: depuis[acc] }));
+  });
+  try {
+    const j = await api({ action: 'banqueSync', depuis, force: !!o.force });
+    if (j.acces) store.set('le31-acces', j.acces);
+    received(j.data, j.moi);
+    if (P.length) commit(P);
+    BK.last = Date.now(); store.set('le31-bk-last', BK.last);
+    const tot = { ops: 0, pts: 0, nc: 0, recal: 0, n: 0 };
+    (j.comptes || []).forEach(c => {
+      BK.err[c.compte] = c.erreur === 'recent' ? '' : c.erreur;
+      if (c.erreur) return;
+      const parsed = { tx: c.tx, solde: c.solde, format: 'Banque' };
+      if (!c.tx.length && !c.solde) return;
+      if (first[c.compte] === 'refaire' || !started(c.compte)) { if (c.tx.length) BK.queue.push({ acc: c.compte, parsed, mode: first[c.compte] === 'refaire' ? 'reset' : null }); return; }
+      const I = startImport(parsed, 'add', { acc: c.compte, silent: true });
+      const r = commitImport(I, true); tot.ops += r.ops; tot.pts += r.pts; tot.nc += r.nc; tot.n++; if (r.recal) tot.recal += r.recal;
+    });
+    BK.res = tot.n ? tot : BK.res;
+  } catch (e) { BK.msg = String(e.message || e); }
+  BK.busy = false;
+  if (BK.queue.length && !UI.imp) { const q = BK.queue.shift(); UI.acc = q.acc; startImport(q.parsed, q.mode, { acc: q.acc }); }
+  render();
+}
+function bankAuto() {
+  if (!BK.auto || BK.busy || UI.imp || BK.view || !LOADED || !bkOn() || bkPend()) return;
+  if (Date.now() - BK.last < 2 * 3600 * 1000) return;
+  if (bkLinked().some(a => bkDays(bkRow(a)) >= 0)) bankSync({});
+}
+async function bankStart(acc, aspsp) {
+  BK.busy = true; render();
+  try {
+    const j = await api({ action: 'banqueAuth', compte: acc, aspsp, retour: location.origin + location.pathname });
+    store.set('le31-bk-going', { acc, aspsp, t: Date.now() });
+    location.href = j.url;
+  } catch (e) { BK.busy = false; toast('Banque : ' + (e.detail || e.message)); render(); }
+}
+// retour de la banque : ?code=…&state=…
+async function bankReturn(code, state) {
+  BK.view = 'retour'; BK.busy = true; render();
+  try {
+    if (!apiOk()) throw Object.assign(new Error('safari'), {});
+    const r = await fetchT(API(), { method: 'POST', body: JSON.stringify({ action: 'banqueRetour', code, state }) });
+    const j = await readJson(r); if (!j.ok) throw Object.assign(new Error(j.erreur || 'erreur'), { detail: j.detail });
+    store.set('le31-bk-going', null);
+    BK.view = null; BK.busy = false; await pull(); render();
+  } catch (e) { BK.busy = false; BK.msg = e.message === 'safari' ? 'safari' : (e.detail || e.message); render(); }
+}
+async function bankLink() {
+  const P = bkPend(); if (!P) return;
+  const liens = P.comptes.map(a => ({ uid: a.uid, compte: BK.sel[a.uid] || '' }));
+  const used = liens.map(l => l.compte).filter(Boolean);
+  if (new Set(used).size !== used.length) { toast('Un compte de Le 31 ne peut suivre qu\'un seul compte bancaire'); return; }
+  BK.busy = true; render();
+  try {
+    const j = await api({ action: 'banqueLier', sid: P.sid, liens }); received(j.data, j.moi);
+    BK.busy = false; BK.view = null;
+    if (!used.length) { toast('Aucun compte suivi'); render(); return; }
+    const first = {}; used.forEach(a => first[a] = started(a) ? (BK.mode[a] || 'reprendre') : 'neuf');
+    toast('Compte' + (used.length > 1 ? 's reliés' : ' relié') + ' : première lecture…');
+    await bankSync({ force: true, first });
+  } catch (e) { BK.busy = false; toast('Banque : ' + (e.detail || e.message)); render(); }
+}
+async function bankUnlink(acc) {
+  try { const j = await api({ action: 'banqueDelier', compte: acc }); received(j.data, j.moi); toast('Compte délié : retour à l\'import de relevés'); } catch (e) { toast('Erreur : ' + e.message); }
+}
+// défaut proposé : compte courant -> compte choisi, compte joint -> commun, épargne -> ne pas suivre
+function bkGuess(P) {
+  const sel = {}, taken = new Set(), N = s => NORM(s);
+  // renouvellement : mêmes associations qu'avant (repérées par la fin de l'IBAN)
+  P.comptes.forEach(a => { const r = a.fin && DB.banque.find(x => x.fin === a.fin && x.aspsp === P.aspsp); if (r && !taken.has(r.compte)) { sel[a.uid] = r.compte; taken.add(r.compte); } });
+  const commun = accs().find(a => !a.proprietaire);
+  P.comptes.forEach(a => { if (/LIVRET|EPARGNE|LDD|LEP|PEL\b|CEL\b|ASSURANCE|PEA|TITRE/.test(N(a.nom))) sel[a.uid] = ''; });
+  P.comptes.forEach(a => { if (sel[a.uid] === undefined && /JOINT|COMMUN/.test(N(a.nom)) && commun && !taken.has(commun.id)) { sel[a.uid] = commun.id; taken.add(commun.id); } });
+  P.comptes.forEach(a => { if (sel[a.uid] === undefined && !taken.has(P.compte)) { sel[a.uid] = P.compte; taken.add(P.compte); } });
+  P.comptes.forEach(a => { if (sel[a.uid] === undefined) sel[a.uid] = ''; });
+  return sel;
+}
+const bkTime = acc => { const r = bkRow(acc); if (!r || !r.derniere) return ''; const d = new Date(r.derniere); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : fmtD(r.derniere); };
+function bankChip() {
+  const el = $('bankChip'); if (!el) return;
+  const acc = UI.acc, r = bkRow(acc);
+  el.hidden = !bkOn() || !r || !!gate() || !!(UI.imp && IMP) || !!BK.view;
+  if (el.hidden) return;
+  const warn = bkDays(r) <= 7 || BK.err[acc] === 'expire';
+  el.className = 'bkchip' + (BK.busy ? ' busy' : warn || BK.err[acc] ? ' warn' : '');
+  el.innerHTML = BK.busy ? '<span class="spin"></span>Banque…' : warn ? '⚠ Banque' : `✓ Banque${bkTime(acc) ? ' · ' + bkTime(acc) : ''}`;
+  el.title = warn ? 'Accord bancaire à renouveler' : 'Lire la banque maintenant';
+}
+// bandeaux de l'onglet Mois
+function bankBanners(acc) {
+  if (!bkOn()) return '';
+  let h = ''; const r = bkRow(acc), e = BK.err[acc];
+  if (BK.res && BK.res.ops + BK.res.pts > 0) h += `<div class="banner good"><span><b>${BK.res.ops} nouvelle${BK.res.ops > 1 ? 's' : ''} opération${BK.res.ops > 1 ? 's' : ''}</b> de la banque${BK.res.pts ? ` · ${BK.res.pts} prélèvement${BK.res.pts > 1 ? 's' : ''} pointé${BK.res.pts > 1 ? 's' : ''}` : ''}${BK.res.nc ? ` · <b>${BK.res.nc} à classer</b>` : ''}</span><span style="display:flex;gap:6px">${BK.res.nc ? '<button class="btn small" data-bkvoir="1">Voir</button>' : ''}<button class="btn ghost small" data-bkok="1">OK</button></span></div>`;
+  if (r && (e === 'expire' || bkDays(r) < 0)) h += `<div class="banner warn"><span>L'accord avec <b>${esc(r.aspsp)}</b> est terminé : Le 31 ne lit plus ce compte.</span><button class="btn small" data-bkrenew="${esc(acc)}">Renouveler</button></div>`;
+  else if (r && bkDays(r) <= 7) h += `<div class="banner warn"><span>L'accord avec <b>${esc(r.aspsp)}</b> se termine dans <b>${bkDays(r)} jour${bkDays(r) > 1 ? 's' : ''}</b>.</span><button class="btn small" data-bkrenew="${esc(acc)}">Renouveler</button></div>`;
+  if (r && e === 'limite') h += `<div class="banner warn"><span>${esc(r.aspsp)} limite le nombre de lectures par jour : nouvel essai plus tard. Données du ${esc(bkTime(acc) || 'dernier passage')}.</span></div>`;
+  else if (r && e && e !== 'expire') h += `<div class="banner warn"><span>Lecture de la banque impossible pour l'instant (${esc(e)}).</span><button class="btn ghost small" data-bksync="1">Réessayer</button></div>`;
+  if (BK.msg && BK.msg !== 'safari') h += `<div class="banner warn"><span>Banque : ${esc(BK.msg)}</span><button class="btn ghost small" data-bksync="1">Réessayer</button></div>`;
+  return h;
+}
+// Réglages > Connexion bancaire
+function vBankSet() {
+  const head = `<div class="rowhead"><h2>Connexion bancaire</h2><span class="sub">V2</span></div>`;
+  if (!bkOn()) return `<div class="hero" style="gap:10px">${head}<div class="hint" style="font-size:13px">Pas encore configurée. La personne qui a installé Le 31 la met en place une fois : application Enable Banking (tuto <b>4-ENABLE-BANKING</b>), puis menu <b>Le 31 > Connexion bancaire</b> dans le Google Sheet. En attendant, l'import de relevés marche comme avant.</div></div>`;
+  const row = a => { const r = bkRow(a.id), d = bkDays(r);
+    return `<div class="item" style="grid-template-columns:40px 1fr auto" disabled><span class="day" style="${r ? 'background:var(--good-soft);color:var(--good)' : ''}">${r ? '✓' : '—'}</span><span class="lbl"><b>${esc(a.nom)}</b><small>${r ? `${esc(r.aspsp)} ${esc(r.fin)} · ${d < 0 ? '<span style="color:var(--bad)">accord terminé</span>' : 'accord jusqu\'au ' + fmtD(r.jusqua)}${r.derniere ? ' · lu ' + esc(bkTime(a.id)) : ''}` : 'Pas relié : import de relevés à la main'}</small></span>
+      <span style="display:flex;gap:6px">${r ? `${d <= 30 ? `<button class="btn small" data-bkrenew="${esc(a.id)}">Renouveler</button>` : ''}<button class="btn ghost small" data-bkunlink="${esc(a.id)}">Délier</button>` : `<button class="btn small" data-bklink="${esc(a.id)}">Relier</button>`}</span></div>`; };
+  return `<div class="hero" style="gap:10px">${head}
+    <div class="hint" style="font-size:13px">Le 31 lit les opérations de la banque à chaque ouverture (lecture seule : aucun virement possible). Via Enable Banking, avec la clé du foyer gardée dans Apps Script.</div>
+    <div class="list">${accs().map(row).join('')}</div>
+    ${DB.profils.length > 1 ? '<div class="hint">À deux : chacun relie son compte perso depuis son téléphone ; le compte commun est relié une seule fois, par l\'un des deux.</div>' : ''}
+    <label class="switch" for="bkAuto"><span style="font-size:14px">Lire la banque à l'ouverture<small class="mini" style="display:block">au plus toutes les 2 h ; « Banque » en haut pour forcer</small></span><input type="checkbox" id="bkAuto" ${BK.auto ? 'checked' : ''}></label>
+    ${bkLinked().length ? `<button class="btn ghost small" data-bksync="1">Lire la banque maintenant</button>` : ''}</div>`;
+}
+// écrans pleine page : choix de la banque, retour, association des comptes
+function vBank() {
+  const close = `<button class="btn ghost small" data-bkclose="1">Annuler</button>`;
+  if (BK.view === 'retour') {
+    if (BK.busy) return `<section class="view center"><div class="logo31">Le 31<span>.</span></div><p class="hint"><span class="spin"></span> Retour de la banque…</p></section>`;
+    if (BK.msg === 'safari') return `<section class="view center"><div class="logo31">Le 31<span>.</span></div><h2>Presque fini</h2><p class="hint" style="font-size:14px">La banque est revenue dans le navigateur plutôt que dans l'appli. Ouvre <b>Le 31</b> depuis l'écran d'accueil et relance <b>Relier</b> : ça prend 30 secondes.</p></section>`;
+    return `<section class="view center"><div class="logo31">Le 31<span>.</span></div><h2>La banque n'a pas confirmé</h2><p class="hint">${esc(BK.msg)}</p><button class="btn" data-bkclose="1">Revenir à l'appli</button></section>`;
+  }
+  if (BK.view === 'bank') {
+    if (!BK.list) return `<section class="view"><div class="rowhead"><h2>Ta banque</h2>${close}</div><p class="hint"><span class="spin"></span> Liste des banques…</p></section>`;
+    const q = NORM(BK.q), l = BK.list.filter(b => !q || NORM(b.n).includes(q)).slice(0, 60);
+    return `<section class="view"><div class="steps"><i class="on"></i><i></i><i></i></div><div class="rowhead"><h2>Ta banque</h2>${close}</div>
+      <p class="hint" style="font-size:14px;margin:0">Pour : <b>${esc(accName(BK.acc))}</b>. Tu vas passer quelques instants sur la page de ta banque pour donner ton accord (lecture seule, ${'180'} jours au plus).</p>
+      <div class="search"><input id="bkQ" placeholder="Rechercher (Crédit Mutuel, Bourso…)" value="${esc(BK.q)}" autocomplete="off"></div>
+      <div class="list">${l.map(b => `<button class="item" style="grid-template-columns:1fr auto" data-bkbank="${esc(b.n)}" ${BK.busy ? 'disabled' : ''}><span class="lbl"><b>${esc(b.n)}</b></span><span>›</span></button>`).join('') || '<div class="empty">Banque introuvable : elle n\'est peut-être pas couverte. L\'import de relevés reste possible.</div>'}</div>
+      ${BK.busy ? '<p class="hint"><span class="spin"></span> Direction la banque…</p>' : ''}
+      ${IOS ? '<div class="note">Sur iPhone/iPad : si la banque ouvre son application pour valider, reviens ensuite sur la page de la banque, elle te ramènera dans Le 31.</div>' : ''}</section>`;
+  }
+  const P = bkPend(); if (!P) { BK.view = null; return ''; }
+  if (!Object.keys(BK.sel).length || !P.comptes.every(a => a.uid in BK.sel)) BK.sel = bkGuess(P);
+  const opts = sel => `<option value="" ${!sel ? 'selected' : ''}>Ne pas suivre</option>` + accs().map(a => `<option value="${esc(a.id)}" ${sel === a.id ? 'selected' : ''}>→ ${esc(a.nom)}</option>`).join('');
+  const chosen = [...new Set(Object.values(BK.sel).filter(Boolean))];
+  return `<section class="view"><div class="steps"><i class="on"></i><i class="on"></i><i></i></div><div class="rowhead"><h2 style="font-size:20px">Quels comptes suivre ?</h2>${close}</div>
+    <p class="hint" style="font-size:14px;margin:0">${esc(P.aspsp)} a partagé ${P.comptes.length} compte${P.comptes.length > 1 ? 's' : ''}. Associe chacun à un compte de Le 31.</p>
+    <div class="list">${P.comptes.map(a => `<div class="rec" style="grid-template-columns:1fr auto"><div class="rl"><b>${esc(a.nom)}</b><div class="raw">${esc(a.fin)}</div><select data-bksel="${esc(a.uid)}">${opts(BK.sel[a.uid])}</select></div><div class="rr">${a.solde ? `<span class="amt ${a.solde.montant >= 0 ? '' : 'neg'}">${eur(a.solde.montant)}</span>` : ''}</div></div>`).join('')}</div>
+    <div class="hint">Un livret d'épargne peut rester « Ne pas suivre » : les virements vers lui sont déjà reconnus comme « Entre mes comptes ».</div>
+    ${chosen.map(acc => started(acc) ? `<div class="hero" style="gap:8px"><b>${esc(accName(acc))}</b>
+      <label class="check"><input type="radio" name="bkm-${esc(acc)}" data-bkmode="${esc(acc)}" value="reprendre" ${(BK.mode[acc] || 'reprendre') === 'reprendre' ? 'checked' : ''}><span><b>Reprendre après le dernier import</b>${lastRefDate(acc) ? ` (${fmtD(lastRefDate(acc))})` : ''}<br><small class="mini">Recommandé : catégories, noms et charges fixes gardés. Seules les nouvelles opérations arrivent, et le solde est recalé sur celui de la banque.</small></span></label>
+      <label class="check"><input type="radio" name="bkm-${esc(acc)}" data-bkmode="${esc(acc)}" value="refaire" ${BK.mode[acc] === 'refaire' ? 'checked' : ''}><span><b>Tout reconstruire depuis la banque</b><br><small class="mini">Comme « Tout refaire » avec un relevé, sur l'historique fourni par la banque (souvent 90 jours à 13 mois).</small></span></label></div>`
+      : `<div class="note">${esc(accName(acc))} : premier import à partir de l'historique de la banque (charges fixes à confirmer, comme avec un relevé).</div>`).join('')}
+    <button class="btn" data-bklier="1" ${BK.busy ? 'disabled' : ''}>${BK.busy ? 'Enregistrement…' : 'Valider'}</button></section>`;
+}
+// annuler l'association : la session bancaire est refermée côté serveur
+async function bankLinkCancel() { const P = bkPend(); if (!P) return; try { const j = await api({ action: 'banqueLier', sid: P.sid, liens: [] }); received(j.data, j.moi); } catch (e) {} }
 
 /* ----- Profils et accès ----- */
 const fmtD = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' }); };
@@ -1614,7 +1835,7 @@ function opSheet(o) {
       <div class="hint" id="kindHint">${kind === 'exc' ? 'Compté dans le solde, pas dans les habitudes ni les prévisions.' : kind === 'int' ? 'Épargne, livret, autre compte à toi : ni dépense ni revenu.' : 'Dépense ou rentrée courante : entre dans les habitudes.'}</div></div>` : ''}
     <div class="field"><label for="oD">Date</label><input id="oD" type="date" value="${esc(o.date)}"></div>
     ${!isVir && !isAdj ? `<button type="button" class="btn ghost" data-tofix="${esc(o.id)}">↻ C'est une charge ${amt > 0 ? 'ou une rentrée ' : ''}régulière : passer en fixe</button>` : ''}
-    <div class="actions"><button type="button" class="btn danger" data-odel=""${esc(o.id)}">Supprimer</button><button class="btn" type="submit">Enregistrer</button></div>
+    <div class="actions"><button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button><button class="btn" type="submit">Enregistrer</button></div>
     <div id="confirmBox"></div></form>`);
 }
 function balSheet() {
@@ -1700,7 +1921,17 @@ document.addEventListener('click', ev => {
     if (ds.impstep === 'go') { commitImport(); return; }
     IMP.step = ds.impstep; render(); scrollTo(0, 0); return;
   }
-  if (ds.impclose) { UI.imp = null; IMP = null; UI.tab = 'home'; render(); scrollTo(0, 0); return; }
+  if (ds.impclose) { UI.imp = null; IMP = null; UI.tab = 'home'; if (BK.queue.length) { const q = BK.queue.shift(); UI.acc = q.acc; startImport(q.parsed, q.mode, { acc: q.acc }); return; } render(); scrollTo(0, 0); return; }
+  if (ds.bklink) { BK.view = 'bank'; BK.acc = ds.bklink; BK.q = ''; BK.list = BK.list || null; render(); scrollTo(0, 0); if (!BK.list) api({ action: 'banques' }).then(j => { BK.list = j.banques; render(); }).catch(e => { toast('Banque : ' + e.message); BK.view = null; render(); }); return; }
+  if (ds.bkbank) { bankStart(BK.acc, ds.bkbank); return; }
+  if (ds.bkrenew) { const r = bkRow(ds.bkrenew); if (r) bankStart(ds.bkrenew, r.aspsp); return; }
+  if (ds.bkunlink) { $('main').querySelector(`[data-bkunlink="${ds.bkunlink}"]`).outerHTML = `<button class="btn danger small" data-bkunlinkok="${esc(ds.bkunlink)}">Confirmer</button>`; return; }
+  if (ds.bkunlinkok) { bankUnlink(ds.bkunlinkok); return; }
+  if (ds.bksync) { bankSync({ force: true }); return; }
+  if (ds.bkok) { BK.res = null; render(); return; }
+  if (ds.bkvoir) { BK.res = null; P.f = 'nc'; P.k = CUR; P.q = ''; UI.tab = 'ponct'; render(); scrollTo(0, 0); return; }
+  if (ds.bkclose) { BK.view = null; BK.msg = ''; if (bkPend()) { BK.view = null; bankLinkCancel(); } render(); return; }
+  if (ds.bklier) { bankLink(); return; }
   if (ds.impmode) {
     if (ds.impmode === 'reset') { $('main').querySelector('[data-impmode=reset]').outerHTML = `<div class="note bad" style="display:flex;flex-direction:column;gap:10px"><span>Tout effacer sur <b>${esc(accName(IMP.acc))}</b> et repartir de ce relevé ?${isShared(IMP.acc) ? ` C'est aussi effacé pour ${esc(otherNames())}.` : ''}</span><button class="btn danger" data-impmode="resetok">Oui, tout refaire</button></div>`; return; }
     startImport(IMP.parsed, ds.impmode === 'resetok' ? 'reset' : 'add'); return;
@@ -1721,6 +1952,7 @@ document.addEventListener('click', ev => {
   if (ds.bn) { BIL.n = +ds.bn; store.set('le31-bil-n', BIL.n); render(); return; }
   if (ds.bmode) { BIL.mode = ds.bmode; store.set('le31-bil-mode', BIL.mode); render(); return; }
   if (ds.tofix) { const o = DB.operations.find(x => x.id === ds.tofix); if (o) { closeSheet(); fixFromOp(o); } return; }
+  if (ds.pview) { P.view = ds.pview; store.set('le31-pview', P.view); render(); return; }
   if (ds.pm) { P.k = addM(P.k || CUR, +ds.pm); render(); return; }
   if (ds.pf) { P.f = ds.pf; render(); return; }
   if ('pcat' in ds) { P.f = 'cat'; P.cat = ds.pcat; P.k = CUR; P.q = ''; UI.tab = 'ponct'; render(); scrollTo(0, 0); return; }
@@ -1763,6 +1995,7 @@ const refocus = id => { const e = $(id); if (e) { e.focus(); const n = e.value.l
 let qT;
 document.addEventListener('input', ev => {
   if (ev.target.id === 'taxdelta') { TAX_DELTA = +ev.target.value; render(); const e = $('taxdelta'); if (e) e.focus(); }
+  if (ev.target.id === 'bkQ') { BK.q = ev.target.value; clearTimeout(qT); qT = setTimeout(() => { render(); refocus('bkQ'); }, 200); return; }
   if (ev.target.id === 'dayV') { UI.dayV = +ev.target.value; render(); const e = $('dayV'); if (e) e.focus(); return; }
   if (ev.target.id === 'pQ') { P.q = ev.target.value; clearTimeout(qT); qT = setTimeout(() => { render(); refocus('pQ'); }, 250); }
   if (ev.target.id === 'impQ') { IMP.q = ev.target.value; IMP.gshow = 30; clearTimeout(qT); qT = setTimeout(() => { render(); refocus('impQ'); }, 250); }
@@ -1783,6 +2016,9 @@ document.addEventListener('change', ev => {
   if (ds.ocat) { const n = $('oCnew'); if (n) { n.hidden = el.value !== '__new'; if (!n.hidden) n.focus(); } return; }
   if (ds.vto) { draft.to = el.value; render(); return; }
   if (el.id === 'onbC') { ONB.commun = el.checked; return; }
+  if (ds.bksel) { BK.sel[ds.bksel] = el.value; render(); return; }
+  if (ds.bkmode) { BK.mode[ds.bkmode] = el.value; return; }
+  if (el.id === 'bkAuto') { BK.auto = el.checked; store.set('le31-bk-auto', BK.auto); return; }
   if (el.id === 'habOn') { UI.hab = el.checked; store.set('le31-hab', UI.hab); render(); return; }
   if (el.id === 'bExc') { BIL.exc = el.checked; render(); return; }
   if (ds.open) { const v = num(el.value); if (el.value.trim() === '' || v !== null) { commit([upd('Comptes', { id: ds.open, soldeDepart: v === null ? '' : r2(v), moisDepart: startMonth(ds.open) })]); toast('Solde de départ mis à jour'); } else toast('Montant invalide'); return; }
@@ -1949,6 +2185,10 @@ window.addEventListener('appinstalled', () => { const b = document.querySelector
 /* ================= Démarrage ================= */
 applyTheme();
 rebuild();
+const BKQ = new URLSearchParams(location.search);
+if (BKQ.get('code') && BKQ.get('state')) { history.replaceState(null, '', location.pathname + location.hash); bankReturn(BKQ.get('code'), BKQ.get('state')); }
+else if (BKQ.get('error')) { history.replaceState(null, '', location.pathname + location.hash); BK.view = 'retour'; BK.msg = 'Accord refusé ou annulé à la banque (' + BKQ.get('error') + ').'; }
+document.getElementById('bankChip').addEventListener('click', () => { const r = bkRow(UI.acc); if (r && (bkDays(r) <= 7 || BK.err[UI.acc] === 'expire')) bankStart(UI.acc, r.aspsp); else bankSync({ force: true }); });
 render();
 if (INV() && apiOk()) join(); else { pull(); flush(); }
 setTimeout(showInstall, 1500);

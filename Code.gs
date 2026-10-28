@@ -1,13 +1,13 @@
 /**
  * LE 31 — serveur (Google Apps Script lié au Google Sheet « Le 31 »)
- * Version 1.4 : règles d'import par compte (nom, catégorie, type), invisibles pour l'autre personne.
+ * Version 2.0 : connexion bancaire directe (Enable Banking) ; V1.4 : règles d'import par compte.
  *
  * À coller dans : Google Sheet > Extensions > Apps Script (remplacer tout le contenu).
  * Ensuite : exécuter une fois la fonction « installer », puis Déployer > Nouveau déploiement > Application Web.
  * Voir le tuto d'installation (iPad ou PC).
  */
 
-const VERSION_SERVEUR = '1.4';
+const VERSION_SERVEUR = '2.0';
 const VALIDITE_LIEN_JOURS = 14;
 
 // Onglets du Google Sheet et leurs colonnes (créés automatiquement)
@@ -24,9 +24,11 @@ const ONGLETS = {
   Regles:      ['id', 'motif', 'categorie', 'compte', 'nom', 'type'],
   Parametres:  ['cle', 'valeur'],
   Acces:       ['id', 'jeton', 'profil', 'appareil', 'cree', 'vu', 'actif'],
-  Invitations: ['code', 'profil', 'cree', 'utilise', 'par']
+  Invitations: ['code', 'profil', 'cree', 'utilise', 'par'],
+  Banque:      ['id', 'compte', 'aspsp', 'fin', 'nom', 'sid', 'jusqua', 'profil', 'derniere', 'solde', 'actif']
 };
-const PRIVES = ['Acces', 'Invitations'];          // jamais modifiables par l'appli directement
+const PRIVES = ['Acces', 'Invitations'];          // jamais renvoyés ni modifiables par l'appli
+const LECTURE = ['Banque'];                       // renvoyé (filtré par compte) mais modifié seulement par le serveur
 const PAR_COMPTE = ['Categories', 'Fixes', 'Operations', 'Pointages', 'Clotures', 'Simulations'];
 
 const DEPART = {
@@ -49,6 +51,7 @@ function installer() {
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('Le 31')
     .addItem("Lien d'accès (installation, nouveau téléphone)", 'montrerLien')
+    .addItem('Connexion bancaire (V2)', 'montrerBanque')
     .addSeparator()
     .addItem('Couper tous les accès (urgence)', 'couperTout')
     .addToUi();
@@ -166,6 +169,7 @@ function doPost_(e) {
   verrou.waitLock(25000);
   try {
     if (c.action === 'rejoindre') return json_(rejoindre_(c.inv, c.appareil));
+    if (c.action === 'banqueRetour') return json_(banqueRetour_(c)); // retour de la banque : le « state » secret tient lieu d'accès
     const a = acces_(c.jeton);
     if (!a) return json_({ ok: false, erreur: 'acces' });
     let moi = a.profil, extra = {};
@@ -185,6 +189,11 @@ function doPost_(e) {
         if ((c.acces && r.id === c.acces) || (!c.acces && c.profil && r.profil === c.profil)) r.actif = 'non';
       }));
       modifier_('Invitations', rows => rows.forEach(i => { if (!c.acces && i.profil === c.profil && !i.utilise) i.utilise = 'annulée'; }));
+    } else if (/^banque/.test(c.action)) {
+      if (!banqueOk_()) return json_({ ok: false, erreur: 'banque non configurée' });
+      const f = { banques: () => ({ ok: true, banques: banques_() }), banqueAuth: () => banqueAuth_(c, moi), banqueLier: () => banqueLier_(c, moi), banqueDelier: () => banqueDelier_(c, moi), banqueSync: () => banqueSync_(c, moi) }[c.action];
+      if (!f) return json_({ ok: false, erreur: 'action inconnue' });
+      const r = f(); if (!r.ok) return json_(r); extra = r;
     } else return json_({ ok: false, erreur: 'action inconnue' });
     SpreadsheetApp.flush();
     return json_(Object.assign({ ok: true, v: VERSION_SERVEUR, moi: moi, acces: a.id, data: tout_(moi) }, extra));
@@ -247,6 +256,7 @@ function tout_(moi) {
     let rows = lire_(nom);
     if (nom === 'Comptes') rows = rows.filter(r => vis.indexOf(r.id) >= 0);
     else if (nom === 'Virements') rows = rows.filter(r => vis.indexOf(r.de) >= 0 || vis.indexOf(r.vers) >= 0);
+    else if (nom === 'Banque') rows = rows.filter(r => vis.indexOf(r.compte) >= 0);
     else if (nom === 'Regles') rows = rows.filter(r => !r.compte || vis.indexOf(r.compte) >= 0); // noms appris d'un perso : privés
     else if (nom === 'Pointages') rows = rows.filter(r => vis.indexOf(r.compte) >= 0 || virVis.indexOf(String(r.cle)) >= 0);
     else if (PAR_COMPTE.indexOf(nom) >= 0) rows = rows.filter(r => vis.indexOf(r.compte) >= 0);
@@ -255,6 +265,8 @@ function tout_(moi) {
   // Appareils de chaque profil (sans les jetons) et liens en attente
   const now = Date.now();
   out.Appareils = lire_('Acces').filter(a => a.profil).map(a => ({ id: a.id, profil: a.profil, appareil: a.appareil, cree: a.cree, vu: a.vu, actif: a.actif }));
+  const pend = moi && propJson_('bkp_' + moi);
+  out.BanqueConf = [{ ok: banqueOk_() ? 'oui' : 'non', attente: pend ? JSON.stringify({ sid: pend.sid, aspsp: pend.aspsp, compte: pend.compte, comptes: pend.comptes }) : '' }];
   out.Attente = lire_('Invitations').filter(i => !i.utilise && i.profil && now - new Date(i.cree).getTime() <= VALIDITE_LIEN_JOURS * 864e5).map(i => ({ profil: i.profil, cree: i.cree }));
   return out;
 }
@@ -267,7 +279,7 @@ function appliquer_(ops, moi) {
   let refus = 0;
   const parOnglet = {};
   ops.forEach(op => {
-    if (!ONGLETS[op.onglet] || PRIVES.indexOf(op.onglet) >= 0) { refus++; return; }
+    if (!ONGLETS[op.onglet] || PRIVES.indexOf(op.onglet) >= 0 || LECTURE.indexOf(op.onglet) >= 0) { refus++; return; }
     (parOnglet[op.onglet] = parOnglet[op.onglet] || []).push(op);
   });
   // ordre : Profils et Comptes d'abord (un nouveau compte doit exister avant ses lignes)
@@ -366,3 +378,192 @@ function maintenant_() { return new Date().toISOString(); }
 function json_(o) {
   return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
 }
+
+/* =================== V2 : connexion bancaire (Enable Banking) =================== */
+// La clé privée et les sessions bancaires restent dans les propriétés du script : jamais dans le Sheet ni dans l'appli.
+const EB_API = 'https://api.enablebanking.com';
+const EB_SYNC_MIN = 2 * 3600 * 1000; // pas plus d'une lecture automatique toutes les 2 h (les banques limitent à ~4 par jour)
+
+/** Menu Le 31 > Connexion bancaire : coller l'identifiant et la clé de l'application Enable Banking. */
+function montrerBanque() {
+  const p = PropertiesService.getScriptProperties();
+  const t = HtmlService.createTemplate(HTML_BANQUE_);
+  t.app = p.getProperty('EB_APP') || '';
+  t.cle = p.getProperty('EB_KEY') ? 'oui' : '';
+  SpreadsheetApp.getUi().showModalDialog(t.evaluate().setWidth(560).setHeight(600), 'Connexion bancaire (V2)');
+}
+/** Appelé par la fenêtre : enregistre puis teste la connexion. */
+function enregistrerBanque(app, cle) {
+  const p = PropertiesService.getScriptProperties();
+  app = String(app || '').trim(); cle = String(cle || '').trim();
+  if (!/^[0-9a-f-]{36}$/i.test(app)) return { ok: false, msg: "L'Application ID ressemble à e9e74fa1-3acc-4f0d-b02c-0ff8e9fb4bdd (le nom du fichier .pem, sans .pem)." };
+  if (cle) {
+    cle = cle.replace(/\r/g, '');
+    if (/BEGIN RSA PRIVATE KEY/.test(cle)) return { ok: false, msg: 'Clé au format « RSA PRIVATE KEY » : il faut le format « PRIVATE KEY » (fichier .pem téléchargé par Enable Banking à la création de l\'application).' };
+    if (!/BEGIN PRIVATE KEY[\s\S]+END PRIVATE KEY/.test(cle)) return { ok: false, msg: 'Colle tout le contenu du fichier .pem, de -----BEGIN PRIVATE KEY----- à -----END PRIVATE KEY-----.' };
+    p.setProperty('EB_KEY', cle);
+  }
+  if (!p.getProperty('EB_KEY')) return { ok: false, msg: 'Colle le contenu du fichier .pem.' };
+  p.setProperty('EB_APP', app);
+  try {
+    const r = eb_('get', '/aspsps?country=FR&psu_type=personal');
+    if (r.code !== 200) return { ok: false, msg: 'Enable Banking refuse la connexion (' + r.code + ') : ' + (r.json.message || r.json.error || r.text).toString().slice(0, 200) };
+    return { ok: true, msg: 'Connexion réussie : ' + (r.json.aspsps || []).length + ' banques françaises disponibles.' };
+  } catch (e) { return { ok: false, msg: 'Erreur : ' + e.message }; }
+}
+
+function b64url_(x) { return Utilities.base64EncodeWebSafe(x).replace(/=+$/, ''); }
+function jwt_() {
+  const p = PropertiesService.getScriptProperties(), app = p.getProperty('EB_APP'), key = p.getProperty('EB_KEY');
+  if (!app || !key) throw new Error('banque non configurée');
+  const now = Math.floor(Date.now() / 1000);
+  const h = b64url_(JSON.stringify({ typ: 'JWT', alg: 'RS256', kid: app }));
+  const b = b64url_(JSON.stringify({ iss: 'enablebanking.com', aud: 'api.enablebanking.com', iat: now, exp: now + 3600 }));
+  return h + '.' + b + '.' + b64url_(Utilities.computeRsaSha256Signature(h + '.' + b, key));
+}
+function eb_(method, path, body, psu) {
+  const opt = { method: method, muteHttpExceptions: true, headers: Object.assign({ Authorization: 'Bearer ' + jwt_() }, psu || {}) };
+  if (body) { opt.contentType = 'application/json'; opt.payload = JSON.stringify(body); }
+  const res = UrlFetchApp.fetch(EB_API + path, opt), text = res.getContentText();
+  let json = {}; try { json = JSON.parse(text || '{}'); } catch (e) {}
+  return { code: res.getResponseCode(), json: json, text: text };
+}
+const banqueOk_ = () => !!(PropertiesService.getScriptProperties().getProperty('EB_APP') && PropertiesService.getScriptProperties().getProperty('EB_KEY'));
+function propJson_(k) { try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(k) || 'null'); } catch (e) { return null; } }
+function setPropJson_(k, v) { const p = PropertiesService.getScriptProperties(); if (v == null) p.deleteProperty(k); else p.setProperty(k, JSON.stringify(v)); }
+
+/** Liste des banques françaises (gardée 6 h). */
+function banques_() {
+  const c = CacheService.getScriptCache(), k = 'eb_aspsps_FR', m = c.get(k);
+  if (m) return JSON.parse(m);
+  const r = eb_('get', '/aspsps?country=FR&psu_type=personal');
+  if (r.code !== 200) throw new Error('banques ' + r.code);
+  const l = (r.json.aspsps || []).map(a => ({ n: a.name, v: Math.floor((a.maximum_consent_validity || 15552000) / 86400) })).sort((a, b) => a.n.localeCompare(b.n));
+  try { c.put(k, JSON.stringify(l), 21600); } catch (e) {}
+  return l;
+}
+
+/** Début de liaison : renvoie l'adresse de la page de la banque. */
+function banqueAuth_(c, moi) {
+  const vis = comptesVisibles_(moi);
+  if (vis.indexOf(c.compte) < 0) return { ok: false, erreur: 'compte' };
+  if (!/^https?:\/\/[^\s]+$/.test(c.retour || '')) return { ok: false, erreur: 'retour' }; // Enable Banking vérifie en plus qu'elle est autorisée
+  const b = banques_().find(x => x.n === c.aspsp); if (!b) return { ok: false, erreur: 'banque inconnue' };
+  const jours = Math.min(180, b.v || 180), state = Utilities.getUuid().replace(/-/g, '');
+  const r = eb_('post', '/auth', { access: { valid_until: new Date(Date.now() + jours * 864e5).toISOString() }, aspsp: { name: b.n, country: 'FR' }, state: state, redirect_url: c.retour, psu_type: 'personal', language: 'fr' });
+  if (r.code !== 200 || !r.json.url) return { ok: false, erreur: 'banque', detail: (r.json.message || r.text || '').toString().slice(0, 300) };
+  setPropJson_('bkst_' + state, { profil: moi, compte: c.compte, aspsp: b.n, cree: Date.now() });
+  return { ok: true, url: r.json.url };
+}
+/** Retour de la banque (?code=&state=) : peut arriver dans Safari plutôt que dans l'appli installée, d'où l'absence de jeton.
+ *  Le « state », secret et à usage unique, rattache le retour à la personne qui a lancé la liaison. */
+function banqueRetour_(c) {
+  const st = propJson_('bkst_' + String(c.state || '').replace(/[^a-f0-9]/gi, ''));
+  if (!st || Date.now() - st.cree > 3600 * 1000) return { ok: false, erreur: 'lien expiré' };
+  setPropJson_('bkst_' + c.state, null);
+  const r = eb_('post', '/sessions', { code: String(c.code || '') });
+  if (r.code !== 200 || !r.json.session_id) return { ok: false, erreur: 'banque', detail: (r.json.message || r.text || '').toString().slice(0, 300) };
+  const sid = 's' + Utilities.getUuid().replace(/-/g, '').slice(0, 12);
+  const accounts = (r.json.accounts || []).map(a => {
+    let solde = null;
+    try { const bl = eb_('get', '/accounts/' + a.uid + '/balances'); solde = choixSolde_(bl.json.balances); } catch (e) {}
+    const iban = (a.account_id && (a.account_id.iban || (a.account_id.other && a.account_id.other.identification))) || '';
+    return { uid: a.uid, fin: iban ? '•••• ' + iban.replace(/\s/g, '').slice(-4) : '', nom: a.name || a.product || 'Compte', solde: solde };
+  });
+  setPropJson_('bks_' + sid, { session: r.json.session_id, aspsp: st.aspsp, jusqua: (r.json.access && r.json.access.valid_until) || '', profil: st.profil });
+  setPropJson_('bkp_' + st.profil, { sid: sid, aspsp: st.aspsp, compte: st.compte, jusqua: (r.json.access && r.json.access.valid_until) || '', comptes: accounts, cree: Date.now() });
+  return { ok: true, aspsp: st.aspsp };
+}
+function choixSolde_(bal) {
+  bal = bal || []; const ord = ['CLBD', 'ITBD', 'XPCD', 'ITAV', 'CLAV', 'OTHR'];
+  const b = bal.slice().sort((x, y) => (ord.indexOf(x.balance_type) + 99) % 99 - (ord.indexOf(y.balance_type) + 99) % 99)[0];
+  if (!b) return null;
+  return { montant: Number(b.balance_amount.amount), date: (b.reference_date || b.last_change_date_time || new Date().toISOString()).slice(0, 10) };
+}
+/** Associer les comptes bancaires aux comptes Le 31. liens = [{uid, compte}] (compte vide = ne pas suivre). */
+function banqueLier_(c, moi) {
+  const pend = propJson_('bkp_' + moi); if (!pend || pend.sid !== c.sid) return { ok: false, erreur: 'rien en attente' };
+  const vis = comptesVisibles_(moi), byUid = {}; pend.comptes.forEach(a => byUid[a.uid] = a);
+  const liens = (c.liens || []).filter(l => l.compte && byUid[l.uid] && vis.indexOf(l.compte) >= 0);
+  const comptes = liens.map(l => l.compte);
+  const anciens = lire_('Banque').filter(r => comptes.indexOf(r.compte) >= 0).map(r => r.sid);
+  modifier_('Banque', rows => {
+    for (let i = rows.length - 1; i >= 0; i--) if (comptes.indexOf(rows[i].compte) >= 0) rows.splice(i, 1); // renouvellement : remplace l'ancienne liaison
+    liens.forEach(l => { const a = byUid[l.uid]; rows.push({ id: l.uid, compte: l.compte, aspsp: pend.aspsp, fin: a.fin, nom: a.nom, sid: pend.sid, jusqua: pend.jusqua, profil: moi, derniere: '', solde: a.solde ? String(a.solde.montant) : '', actif: 'oui' }); });
+  });
+  setPropJson_('bkp_' + moi, null);
+  nettoyerSessions_(anciens);
+  if (!liens.length) nettoyerSessions_([pend.sid]);
+  return { ok: true, n: liens.length };
+}
+function nettoyerSessions_(sids) {
+  const used = lire_('Banque').map(r => r.sid);
+  sids.filter((s, i) => s && sids.indexOf(s) === i && used.indexOf(s) < 0).forEach(s => {
+    const S = propJson_('bks_' + s); if (S) { try { eb_('delete', '/sessions/' + S.session); } catch (e) {} }
+    setPropJson_('bks_' + s, null);
+  });
+}
+function banqueDelier_(c, moi) {
+  const vis = comptesVisibles_(moi); let sid = null;
+  modifier_('Banque', rows => { for (let i = rows.length - 1; i >= 0; i--) if (rows[i].compte === c.compte && vis.indexOf(c.compte) >= 0) { sid = rows[i].sid; rows.splice(i, 1); } });
+  if (sid) nettoyerSessions_([sid]);
+  return { ok: true };
+}
+/** Lecture des opérations. c.depuis = { compte: 'AAAA-MM-JJ' } ; c.force = lecture demandée par la personne. */
+function banqueSync_(c, moi) {
+  const vis = comptesVisibles_(moi), now = Date.now(), out = [], maj = {};
+  const rows = lire_('Banque').filter(r => vis.indexOf(r.compte) >= 0 && r.actif === 'oui' && (!c.comptes || c.comptes.indexOf(r.compte) >= 0));
+  const psu = null; // sans en-têtes « PSU » : lecture considérée comme automatique (≈ 4 par jour selon la banque)
+  rows.forEach(r => {
+    const res = { compte: r.compte, aspsp: r.aspsp, tx: [], solde: null, erreur: '' };
+    if (!c.force && r.derniere && now - new Date(r.derniere).getTime() < EB_SYNC_MIN) { res.erreur = 'recent'; out.push(res); return; }
+    if (r.jusqua && new Date(r.jusqua).getTime() < now) { res.erreur = 'expire'; out.push(res); return; }
+    const S = propJson_('bks_' + r.sid); if (!S) { res.erreur = 'expire'; out.push(res); return; }
+    const from = /^\d{4}-\d{2}-\d{2}$/.test((c.depuis || {})[r.compte] || '') ? c.depuis[r.compte] : new Date(now - 90 * 864e5).toISOString().slice(0, 10);
+    let key = '', pages = 0;
+    try {
+      do {
+        const q = '/accounts/' + r.id + '/transactions?date_from=' + from + (key ? '&continuation_key=' + encodeURIComponent(key) : '');
+        let t = eb_('get', q, null, psu);
+        if (t.code === 422 && psu && /PSU_HEADER/.test(t.text)) t = eb_('get', q); // en-têtes refusés : on réessaie sans
+        if (t.code === 429) { res.erreur = 'limite'; break; }
+        if (t.code === 401 || /EXPIRED_SESSION|SESSION/.test(t.json.error || t.json.code || '') && t.code >= 400) { res.erreur = 'expire'; break; }
+        if (t.code !== 200) { res.erreur = 'banque ' + t.code + ' ' + (t.json.message || '').toString().slice(0, 120); break; }
+        (t.json.transactions || []).forEach(x => {
+          if (x.status && x.status !== 'BOOK') return; // les opérations « à venir » arriveront une fois comptabilisées
+          const a = Number((x.transaction_amount || {}).amount || 0) * (x.credit_debit_indicator === 'DBIT' ? -1 : 1);
+          const lib = [].concat(x.remittance_information || []).join(' ').replace(/\s+/g, ' ').trim() || ((x.credit_debit_indicator === 'DBIT' ? x.creditor : x.debtor) || {}).name || 'Opération';
+          res.tx.push({ date: (x.booking_date || x.value_date || x.transaction_date || '').slice(0, 10), montant: Math.round(a * 100) / 100, libelle: lib });
+        });
+        key = t.json.continuation_key || '';
+      } while (key && ++pages < 30);
+      if (!res.erreur) {
+        const bl = eb_('get', '/accounts/' + r.id + '/balances', null, psu);
+        if (bl.code === 200) res.solde = choixSolde_(bl.json.balances);
+        maj[r.id] = { derniere: new Date().toISOString(), solde: res.solde ? String(res.solde.montant) : r.solde };
+      }
+    } catch (e) { res.erreur = 'serveur ' + e.message; }
+    res.tx = res.tx.filter(x => x.date);
+    res.jusqua = r.jusqua;
+    out.push(res);
+  });
+  if (Object.keys(maj).length) modifier_('Banque', rs => rs.forEach(x => { if (maj[x.id]) Object.assign(x, maj[x.id]); }));
+  return { ok: true, comptes: out };
+}
+
+const HTML_BANQUE_ = `
+<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5">
+  <p>Branche Le 31 sur ton application <b>Enable Banking</b> (tuto 4-ENABLE-BANKING). La clé reste dans les propriétés de ce script : elle n'apparaît ni dans le Sheet ni dans l'appli.</p>
+  <p><b>1.</b> Application ID (le nom du fichier .pem, sans « .pem ») :</p>
+  <input id="a" style="width:100%;padding:6px;font-size:14px" value="<?= app ?>" placeholder="e9e74fa1-3acc-4f0d-b02c-0ff8e9fb4bdd">
+  <p><b>2.</b> Contenu du fichier .pem (ouvre-le avec le Bloc-notes / TextEdit, copie tout) <span style="color:#1C8556"><?= cle ? '· une clé est déjà enregistrée : laisse vide pour la garder' : '' ?></span> :</p>
+  <textarea id="k" style="width:100%;height:170px;font-size:12px;font-family:monospace" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"></textarea>
+  <p><button id="b" onclick="go()" style="font-size:15px;padding:6px 14px">Enregistrer et tester</button></p>
+  <p id="r"></p>
+</div>
+<script>
+  function go(){ var b=document.getElementById('b'), r=document.getElementById('r'); b.disabled=true; r.style.color='#5A6480'; r.textContent='Test en cours…';
+    google.script.run.withSuccessHandler(function(x){ b.disabled=false; r.style.color=x.ok?'#1C8556':'#C3322A'; r.textContent=x.msg; if(x.ok) document.getElementById('k').value=''; })
+      .withFailureHandler(function(e){ b.disabled=false; r.style.color='#C3322A'; r.textContent='Erreur : '+e.message; })
+      .enregistrerBanque(document.getElementById('a').value, document.getElementById('k').value); }
+</script>`;

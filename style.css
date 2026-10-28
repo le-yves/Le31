@@ -245,3 +245,12 @@ nav.tabs button{font-size:10.5px;padding-inline:0}
 .item.child{padding-left:30px}
 .bchip.kid{font-size:13px;padding:5px 11px}
 .bdet{border-style:dashed;color:var(--accent);font-size:13px;padding:5px 11px}
+
+/* V2 : banque */
+.bkchip{border:0;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--good);background:var(--good-soft);border-radius:99px;padding:5px 10px;text-transform:none;letter-spacing:0;white-space:nowrap}
+.bkchip.warn{color:var(--warn);background:var(--warn-soft)} .bkchip.busy{color:var(--accent);background:var(--accent-soft)}
+.spin{width:13px;height:13px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin 1s linear infinite;display:inline-block;vertical-align:-2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin{animation:none}}
+.check{display:flex;gap:10px;align-items:flex-start;font-size:14px}.check input{width:20px;height:20px;margin-top:2px;accent-color:var(--accent);flex:none}
+.banner.good{background:var(--good-soft)}
