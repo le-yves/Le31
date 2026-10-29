@@ -2,7 +2,7 @@
    Données : Google Sheet via Google Apps Script. Lien d'accès à usage unique (#inv=CODE&api=URL /exec) échangé contre
    un jeton propre à l'appareil. Chacun voit le compte commun et son compte perso. config.js (apiUrl) facultatif. */
 'use strict';
-const APP_VERSION = '2.1';
+const APP_VERSION = '2.2';
 
 /* ================= Barème impôt (à mettre à jour chaque année) =================
    Barème 2026 sur les revenus 2025, par part. Plafond quotient familial : 1 807 € par demi-part.
@@ -380,6 +380,62 @@ function forecast(acc, n, o) {
   return (CACHE[ck] = out);
 }
 const curMonth = acc => calc(acc, CUR, startOf(acc, CUR), { mode: 'budget', noHab: !UI.hab });
+
+/* ================= Mois basé sur la paie (V2.2) ================= */
+// On ne touche pas aux mois calendaires (clôtures, Bilan, Relevé complet, solde banque) : seul l'onglet Mois,
+// pour son chiffre de fin et sa courbe, peut afficher la fenêtre « d'une paie à l'autre » plutôt que le 1er → 31.
+// La fenêtre est recalculée à chaque ouverture et ne fait que découper les jours déjà calculés par mois calendaire :
+// un même jour n'appartient jamais qu'à une seule fenêtre, donc rien ne peut être compté deux fois ni oublié.
+const dLabel = iso => (+iso.slice(8, 10)) + ' ' + MONTHS[pm(iso.slice(0, 7)).m];
+const daysBetween = (a, b) => Math.round((new Date(b + 'T12:00:00Z') - new Date(a + 'T12:00:00Z')) / 864e5);
+// Rentrée fixe choisie comme déclencheur (réglage explicite, sinon la plus grosse rentrée mensuelle active)
+function salaryFixeId(acc) {
+  const stored = param('payeFixe|' + acc, '');
+  if (stored && DB.fixes.some(f => f.id === stored && f.compte === acc && bool(f.actif) && f.sens === '+')) return stored;
+  const cands = DB.fixes.filter(f => f.compte === acc && bool(f.actif) && f.sens === '+' && (f.frequence || 'M') === 'M');
+  if (!cands.length) return null;
+  const amtOf = f => { const pts = DB.pointages.filter(p => p.cle === 'f' + f.id).map(p => num(p.montantReel)).filter(x => x != null); return pts.length ? median(pts) : (num(f.montant) || 0); };
+  return cands.slice().sort((a, b) => amtOf(b) - amtOf(a))[0].id;
+}
+function payOn(acc) { const v = param('payeOn|' + acc, ''); return v ? v === 'oui' : !!salaryFixeId(acc); }
+function payHisto(acc) { try { return JSON.parse(param('paye|' + acc, '{}')) || {}; } catch (e) { return {}; } }
+// Dates de la rentrée choisie, mois par mois : réelle si on l'a vue passer (banque/import), sinon son jour habituel
+function payDates(acc, fid) {
+  const f = DB.fixes.find(x => x.id === fid); if (!f) return {};
+  const h = payHisto(acc)[fid] || {}, out = {};
+  for (let k = startMonth(acc); k <= CUR; k = addM(k, 1)) if (occursF(f, k)) out[k] = h[k] || (k + '-' + pad(Math.min(num(f.jour) || 1, dim(k))));
+  return out;
+}
+// Fenêtre en cours : de la dernière paie détectée à la prochaine estimée (ou fixée à la main si elle n'est pas encore passée)
+function payState(acc) {
+  if (!payOn(acc)) return null;
+  const fid = salaryFixeId(acc); if (!fid) return null;
+  const dates = payDates(acc, fid), ks = Object.keys(dates).sort();
+  const past = ks.filter(k => dates[k] <= TODAY_ISO); if (!past.length) return null;
+  const startK = past[past.length - 1], start = dates[startK], idx = ks.indexOf(startK);
+  const gaps = []; for (let i = Math.max(1, idx - 2); i <= idx; i++) if (ks[i - 1] !== undefined) gaps.push(daysBetween(dates[ks[i - 1]], dates[ks[i]]));
+  const avg = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : 30;
+  const auto = isoAdd(start, Math.min(40, Math.max(20, avg)));
+  const over = param('payeFin|' + acc, ''), manual = !!(over && over > TODAY_ISO && over > start);
+  return { fixe: fid, start, end: manual ? over : auto, auto, manual };
+}
+// Courbe de solde jour par jour sur la fenêtre de paie : enchaîne les mois calendaires déjà calculés par calc(), sans dupliquer le moteur
+function periodCalc(acc, PS) {
+  const months = []; for (let k = PS.start.slice(0, 7); k <= PS.end.slice(0, 7); k = addM(k, 1)) months.push(k);
+  let s = startOf(acc, months[0]); const dates = [], curve = [];
+  months.forEach(k => {
+    const r = calc(acc, k, s, { mode: 'budget', noHab: !UI.hab });
+    for (let d = 1; d <= r.D; d++) { const date = k + '-' + pad(d); if (date >= PS.start && date < PS.end) { dates.push(date); curve.push(r.curve[d - 1]); } }
+    s = r.end;
+  });
+  const D = dates.length, T = dates.filter(d => d <= TODAY_ISO).length;
+  const bal = T ? curve[T - 1] : (num(accOf(acc).soldeDepart) || 0), end = curve[D - 1];
+  let low = { d: D, v: Infinity }; for (let i = T; i < D; i++) if (curve[i] < low.v) low = { d: i + 1, v: curve[i] };
+  return { D, T, dates, curve, bal, end, low };
+}
+// Marchand avec deux usages distincts selon le montant (ex. MAGASIN U = courses ou carburant)
+function seuilRule(acc, lib) { try { return JSON.parse(param('seuilCat|' + acc + '|' + keyOf(lib), '')) || null; } catch (e) { return null; } }
+
 function status(end, seuil) {
   if (end < 0) return { c: 'bad', t: 'Dépassement prévu', msg: `Il manque ${eur0(-end)} pour finir le mois` };
   if (end < seuil) return { c: 'warn', t: 'Budget serré', msg: `Marge de ${eur0(end)}, sous le seuil de ${eur0(seuil)}` };
@@ -566,7 +622,8 @@ function vHome() {
       <form class="form" id="startForm" novalidate><div class="amountbox"><input id="startBal" inputmode="decimal" placeholder="0,00" aria-label="Solde actuel" autocomplete="off"><span>€</span></div>
       <button class="btn ghost" type="submit">Démarrer avec ce solde</button></form></div>
     ${isShared(acc) ? `<div class="note">Compte partagé : une seule personne le démarre, l'autre le retrouvera déjà prêt.</div>` : ''}</section>`;
-  const r = curMonth(acc), seuil = seuilOf(acc), st = status(r.end, seuil);
+  const r = curMonth(acc), seuil = seuilOf(acc);
+  const PS = payState(acc), PC = PS && periodCalc(acc, PS), H = PC || r, st = status(H.end, seuil);
   const upcoming = r.ev.filter(e => e.d > r.T).sort((a, b) => a.d - b.d);
   const recent = r.ev.filter(e => e.d <= r.T && ['ponct', 'exc', 'ajust', 'virop'].includes(e.kind)).sort((a, b) => b.d - a.d || String(b.id).localeCompare(String(a.id))).slice(0, 5);
   const toRecon = r.ev.filter(e => (e.kind === 'fixe' || e.kind === 'vir') && e.d <= r.T && !e.ok).sort((a, b) => a.d - b.d);
@@ -575,23 +632,26 @@ function vHome() {
   const pSpent = r.cats.reduce((a, c) => a + c.spent, 0), pHab = r.cats.reduce((a, c) => a + c.target, 0);
   const grp = {}; r.cats.forEach(c => { const t = topOf(c.nom), g = grp[t] = grp[t] || { nom: t, spent: 0, target: 0, budget: 0, n: 0 }; g.spent += c.spent; g.target += c.target; g.budget += num(c.budget) || 0; g.n += c.nom.includes(SEP) ? 1 : 0; });
   const cats = Object.values(grp).filter(c => c.spent > 0.5 || c.target > 0.5).sort((a, b) => Math.max(b.spent, b.target) - Math.max(a.spent, a.target)).slice(0, 6);
-  const unc = firstUnclosed(acc), frac = r.T / r.D, dv = Math.min(r.D, Math.max(1, UI.dayV || TODAY));
+  const unc = firstUnclosed(acc), frac = r.T / r.D, dv = Math.min(H.D, Math.max(1, UI.dayV || H.T || 1));
+  const dayTxt = PC ? dLabel(PC.dates[dv - 1]) : dv + ' ' + MONTHS[pm(CUR).m];
+  const lowTxt = PC ? dLabel(PC.dates[H.low.d - 1]) : H.low.d + ' ' + MONTHS[pm(CUR).m];
   return `<section class="view">
   ${banners(acc)}
   ${unc ? `<div class="banner warn"><span><b>${mLabel(unc)}</b> n'est pas clôturé.</span><button class="btn small" data-close-month="${unc}">Clôturer</button></div>` : ''}
   <div class="hero">
-    <div class="rowhead"><span class="sub">Fin ${MONTHS_L[pm(CUR).m]} prévue</span><span class="pill ${st.c}">${st.t}</span></div>
-    <div class="big num">${eur0(r.end)}</div>
+    <div class="rowhead"><span class="sub">${PC ? `Avant la prochaine paie${PS.manual ? ' (date fixée à la main)' : ' · estimée au ' + dLabel(PS.end)}` : `Fin ${MONTHS_L[pm(CUR).m]} prévue`}</span><span class="pill ${st.c}">${st.t}</span></div>
+    <div class="big num">${eur0(H.end)}</div>
     <div style="font-weight:600;color:var(--${st.c})">${st.msg}</div>
+    ${PC ? `<div class="hint" style="margin-top:-4px">Période en cours : du ${dLabel(PS.start)} au ${dLabel(PS.end)}, d'après ta rentrée « ${esc((DB.fixes.find(f => f.id === PS.fixe) || {}).libelle || '')} ». Modifiable dans Réglages.</div>` : ''}
     <div class="kv">
-      <div><small>Solde estimé au ${TODAY} ${MONTHS[pm(CUR).m]}</small><b>${eur(r.bal)}</b></div>
-      <div><small>D'ici le ${r.D}</small><b>${sgn(r2(r.end - r.bal))}</b></div>
+      <div><small>Solde estimé au ${TODAY} ${MONTHS[pm(CUR).m]}</small><b>${eur(H.bal)}</b></div>
+      <div><small>D'ici le ${PC ? dLabel(PS.end) : r.D}</small><b>${sgn(r2(H.end - H.bal))}</b></div>
     </div>
-    ${curveSVG(r, seuil, dv)}
-    <label class="daysim" for="dayV"><span>Le <b class="num">${dv}</b> ${MONTHS[pm(CUR).m]}</span><input type="range" id="dayV" min="1" max="${r.D}" value="${dv}" aria-label="Jour du mois"><b class="num" style="color:var(--${r.curve[dv - 1] < 0 ? 'bad' : 'ink'})">${eur0(r.curve[dv - 1])}</b></label>
-    <div class="hint" style="margin-top:-8px">${dv < TODAY ? 'Solde réel ce jour-là (opérations connues).' : dv === TODAY ? 'Solde estimé aujourd\'hui.' : `Solde prévu ce jour-là : charges fixes à leur date${UI.hab ? ', ponctuel habituel réparti sur les jours' : ''}.`} Fais glisser pour voir un autre jour.</div>
+    ${curveSVG(H, seuil, dv)}
+    <label class="daysim" for="dayV"><span>Le <b class="num">${dayTxt}</b></span><input type="range" id="dayV" min="1" max="${H.D}" value="${dv}" aria-label="Jour"><b class="num" style="color:var(--${H.curve[dv - 1] < 0 ? 'bad' : 'ink'})">${eur0(H.curve[dv - 1])}</b></label>
+    <div class="hint" style="margin-top:-8px">${dv < H.T ? 'Solde réel ce jour-là (opérations connues).' : dv === H.T ? 'Solde estimé aujourd\'hui.' : `Solde prévu ce jour-là : charges fixes à leur date${UI.hab ? ', ponctuel habituel réparti sur les jours' : ''}.`} Fais glisser pour voir un autre jour.</div>
     <label class="switch" for="habOn" style="gap:10px"><span style="font-size:14px">Prévoir le ponctuel d'après nos habitudes<small class="mini" style="display:block">${UI.hab ? `Reste estimé : ${eur0(r.varRem)} de dépenses${r.incRem > 0.5 ? `, ${eur0(r.incRem)} de rentrées` : ''}` : 'Coupé : seulement les charges fixes et les opérations connues'}</small></span><input type="checkbox" id="habOn" ${UI.hab ? 'checked' : ''}></label>
-    ${r.low.v < 0 ? `<div class="alert bad">Découvert prévu le ${r.low.d} ${MONTHS[pm(CUR).m]} : ${eur0(r.low.v)}</div>` : ''}
+    ${H.low.v < 0 ? `<div class="alert bad">Découvert prévu le ${lowTxt} : ${eur0(H.low.v)}</div>` : ''}
     <div class="actions"><button class="btn ghost small" data-fixbal="1">Corriger le solde</button><label class="btn ghost small" style="text-align:center;flex:1">Importer un relevé<input type="file" id="impFile" accept=".csv,.ofx,.qfx,.txt,text/csv" hidden></label></div>
     <div id="impErr"></div>
   </div>
@@ -624,6 +684,12 @@ function banners(acc) {
   DB.virements.filter(v => v.vers === acc && bool(v.actif)).forEach(v => { const f = dupFixeFor(v); if (f) h += `<div class="banner warn"><span>« <b>${esc(f.libelle)}</b> » fait doublon avec le virement lié « ${esc(v.libelle)} » : compté deux fois.</span><button class="btn small" data-dupfix="${esc(f.id)}" data-dupvir="${esc(v.id)}">Corriger</button></div>`; });
   if (DB.operations.some(o => o.compte === acc && o.ref) && !param('imp14|' + acc, '') && !store.get('le31-noreimp|' + acc, false))
     h += `<div class="banner"><span style="display:flex;flex-direction:column;gap:8px">Ce compte a été importé avec une ancienne version. <span><b>Refais l'import</b> avec le même relevé et choisis « Tout refaire » : charges fixes, noms et prévisions seront justes.</span><span class="actions"><label class="btn small" style="text-align:center">Choisir le relevé<input type="file" id="impFile" accept=".csv,.ofx,.qfx,.txt,text/csv" hidden></label><button class="btn ghost small" data-noreimp="${esc(acc)}">Plus tard</button></span></span></div>`;
+  const PS = payState(acc);
+  if (PS) {
+    const vuKey = 'le31-payeVu|' + acc, vu = store.get(vuKey, '');
+    if (vu && vu !== PS.start) { store.set(vuKey, PS.start); h += `<div class="banner"><span>Nouvelle paie détectée le <b>${dLabel(PS.start)}</b> : la période affichée va maintenant jusqu'au ${dLabel(PS.end)} environ. Rien n'est compté en double : c'est seulement la fenêtre affichée qui avance avec la paie.</span></div>`; }
+    else if (!vu) store.set(vuKey, PS.start);
+  }
   return h;
 }
 
@@ -993,7 +1059,18 @@ function vSet() {
     <div class="field"><label for="md-${esc(k)}">Mois de départ</label><input id="md-${esc(k)}" type="month" data-mdep="${esc(k)}" value="${esc(startMonth(k))}" max="${CUR}"></div>
     <div class="hint">Le solde de départ est le solde au 1er du mois de départ. Pour recaler en cours de mois, utilise plutôt « Corriger le solde » dans l'onglet Mois.</div>
     <div class="field"><label>Catégories de dépenses</label><div class="list">${cats.length ? cats.map(c => `<button class="item ${c.nom.includes(SEP) ? 'child' : ''}" data-editcat="${esc(c.id)}"><span class="day">${c.nom.includes(SEP) ? '↳' : num(c.budget) ? '◔' : '·'}</span><span class="lbl"><b>${esc(leafOf(c.nom))}</b><small>${num(c.budget) ? 'enveloppe mensuelle' : 'sans enveloppe'}</small></span><span class="amt">${num(c.budget) ? eur0(num(c.budget)) : ''}</span></button>`).join('') : '<div class="empty">Aucune catégorie.</div>'}</div></div>
-    <button class="btn ghost small" data-newcat="${esc(k)}">＋ Ajouter une catégorie</button></div>`; };
+    <button class="btn ghost small" data-newcat="${esc(k)}">＋ Ajouter une catégorie</button></div>
+    ${(() => {
+      const cands = DB.fixes.filter(f => f.compte === k && bool(f.actif) && f.sens === '+' && (f.frequence || 'M') === 'M');
+      if (!cands.length) return '';
+      const fid = salaryFixeId(k), on = payOn(k), PS2 = on && payState(k);
+      return `<div class="hero" style="gap:10px"><div class="rowhead"><h2>Mois basé sur la paie</h2></div>
+      <label class="switch" for="payOn-${esc(k)}"><span>Le mois affiché (onglet Mois) commence à la paie plutôt qu'au calendaire<small class="mini" style="display:block">Détection automatique de l'arrivée de la rentrée, projection de la prochaine</small></span><input type="checkbox" id="payOn-${esc(k)}" data-payon="${esc(k)}" ${on ? 'checked' : ''}></label>
+      ${on ? (cands.length > 1 ? `<div class="field"><label for="payF-${esc(k)}">Rentrée qui déclenche le mois</label><select id="payF-${esc(k)}" data-payfixe="${esc(k)}">${cands.map(f => `<option value="${esc(f.id)}" ${f.id === fid ? 'selected' : ''}>${esc(f.libelle)}</option>`).join('')}</select></div>` : `<div class="hint">Déclencheur : <b>${esc(cands[0].libelle)}</b>.</div>`) : ''}
+      ${on ? (PS2 ? `<div class="hint">Période en cours : du ${dLabel(PS2.start)} au ${dLabel(PS2.end)}${PS2.manual ? ' (date de fin fixée à la main)' : ' (estimation automatique, d\'après les dernières paies)'}.</div>
+      <div class="two"><div class="field"><label for="payEnd-${esc(k)}">Date de fin de la période (modifiable)</label><input type="date" id="payEnd-${esc(k)}" data-payend="${esc(k)}" value="${esc(PS2.end)}"></div>${PS2.manual ? `<button type="button" class="btn ghost small" data-payauto="${esc(k)}" style="align-self:end">Recalculer automatiquement</button>` : ''}</div>` : `<div class="hint">Pas encore de paie vue sur ce compte depuis le début du mois de départ : le mois calendaire est utilisé pour l'instant.</div>`) : ''}
+      </div>`; })()}
+    `; };
   const syncTxt = { ok: 'Synchronisé', wait: 'Envoi en cours…', off: 'Hors ligne', err: 'Accès coupé' }[SYNC.state] || '';
   return `<section class="view">
     <div class="hero" style="gap:6px"><div class="rowhead"><h2>Apparence</h2></div>
@@ -1154,7 +1231,11 @@ function ruleOf(acc, lib, montant) {
   const k = keyOf(lib), m = motifOf(lib), s = montant > 0 ? '+' + k : null;
   return (s && DB.regles.find(x => x.compte === acc && x.motif === s)) || DB.regles.find(x => x.compte === acc && x.motif === k) || DB.regles.find(x => !x.compte && (x.motif === k || x.motif === m));
 }
-function guessCat(lib, montant, acc) { return resolveCat(acc || UI.acc, guessCat0(lib, montant, acc)); }
+function guessCat(lib, montant, acc) {
+  acc = acc || UI.acc;
+  const sr = seuilRule(acc, lib); if (sr) return resolveCat(acc, Math.abs(num(montant) || 0) > num(sr.s) ? sr.haut : sr.bas);
+  return resolveCat(acc, guessCat0(lib, montant, acc));
+}
 function guessCat0(lib, montant, acc) {
   const r = ruleOf(acc || UI.acc, lib, montant); if (r && r.categorie) return r.categorie;
   const N = NORM(lib), d = dico(N);
@@ -1493,7 +1574,9 @@ function dupFixeFor(v) {
 function commitImport(I0, silent) {
   const I = I0 || IMP, acc = I.acc, ops = [], pts = {}, res = { ops: 0, fixes: 0, pts: 0, clos: 0, exc: 0, nc: 0, dbl: 0 };
   const addPt = (t, cle) => { const k = t.date.slice(0, 7), id = k + '|' + cle; if (!pts[id]) pts[id] = { id, compte: acc, mois: k, cle, montantReel: 0 }; pts[id].montantReel = r2(pts[id].montantReel + Math.abs(t.montant)); };
-  I.kept.filter(t => t.match).forEach(t => addPt(t, t.match));
+  // date réelle d'une rentrée fixe vue passer (banque ou import) : gardée pour détecter automatiquement le jour de paie (V2.2)
+  const payArr = {}, notePay = (fid, t) => { (payArr[fid] = payArr[fid] || {})[t.date.slice(0, 7)] = t.date; };
+  I.kept.filter(t => t.match).forEach(t => { addPt(t, t.match); if (t.match[0] === 'f') { const f = DB.fixes.find(x => x.id === t.match.slice(1)); if (f && f.sens === '+') notePay(f.id, t); } });
   I.kept.filter(t => t.same).forEach(t => ops.push(upd('Operations', { id: t.same, ref: t.ref })));
   const have = new Set(catsOf(acc).map(c => c.nom.toLowerCase()));
   let ordre = Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0));
@@ -1505,7 +1588,7 @@ function commitImport(I0, silent) {
       ops.push(upd('Virements', v)); inK.forEach(t => addPt(t, 'v' + id));
       const f = dupFixeFor(v); // le relevé du commun a déjà créé cette rentrée : on la remplace par le virement lié
       if (f) { ops.push(del('Fixes', f.id)); DB.pointages.filter(p => p.cle === 'f' + f.id).forEach(p => { ops.push(del('Pointages', p.id)); const nid = p.mois + '|v' + id; if (!pts[nid]) pts[nid] = { id: nid, compte: p.compte, mois: p.mois, cle: 'v' + id, montantReel: p.montantReel }; }); res.dbl++; }
-    } else { ops.push(upd('Fixes', { id, compte: acc, libelle: r.nom, montant: r.montant, sens: r.sens, jour: r.jour, frequence: 'M', moisRef: '', categorie: r.cat, debut: I.mois, fin: '', actif: 'oui', motif: r.motif })); inK.forEach(t => addPt(t, 'f' + id)); }
+    } else { ops.push(upd('Fixes', { id, compte: acc, libelle: r.nom, montant: r.montant, sens: r.sens, jour: r.jour, frequence: 'M', moisRef: '', categorie: r.cat, debut: I.mois, fin: '', actif: 'oui', motif: r.motif })); inK.forEach(t => { addPt(t, 'f' + id); if (r.sens === '+') notePay(id, t); }); }
     res.fixes++;
   });
   const rest = impRest(I);
@@ -1534,6 +1617,11 @@ function commitImport(I0, silent) {
     }
   }
   ops.push(upd('Parametres', { cle: 'imp14|' + acc, valeur: TODAY_ISO }));
+  if (Object.keys(payArr).length) {
+    let h; try { h = JSON.parse(param('paye|' + acc, '{}')) || {}; } catch (e) { h = {}; }
+    Object.entries(payArr).forEach(([fid, ms]) => h[fid] = Object.assign(h[fid] || {}, ms));
+    ops.push(upd('Parametres', { cle: 'paye|' + acc, valeur: JSON.stringify(h) }));
+  }
   const recal = !I.first && I.solde && I.recal ? r2(soldeDelta(I).delta) : 0;
   commit(ops);
   if (Math.abs(recal) >= 1) { commit([upd('Operations', { id: uid(), compte: acc, date: I.solde.date, montant: recal, categorie: 'Correction de solde', libelle: I.parsed.format === 'Banque' ? 'Correction (solde de la banque)' : 'Correction (relevé importé)', profil: ME, type: 'ajust', lien: '', ref: '' })]); res.recal = recal; }
@@ -1831,11 +1919,26 @@ function opSheet(o) {
     ${!isVir && !isAdj ? `<div class="field"><label for="oC">Catégorie</label><select id="oC" data-ocat="1"><option value="" ${o.categorie ? '' : 'selected'}>À classer</option>${cats.map(c => `<option ${c === o.categorie ? 'selected' : ''}>${esc(c)}</option>`).join('')}<option value="__new">＋ Nouvelle catégorie…</option></select>
       <input id="oCnew" placeholder="Ex. Véhicule > Garage (sous-catégorie) ou Animaux" autocomplete="off" hidden style="margin-top:6px"></div>
       ${sim.length ? `<label class="switch" for="oSim" style="gap:10px"><span style="font-size:14px">Appliquer la catégorie aux <b>${sim.length}</b> autre${sim.length > 1 ? 's' : ''} opération${sim.length > 1 ? 's' : ''} de ce marchand, et aux prochains imports</span><input type="checkbox" id="oSim" checked></label>` : ''}
+      ${imp ? `<button type="button" class="btn ghost small" data-seuil2="${esc(o.id)}" style="margin-top:2px">${seuilRule(acc, o.libelle) ? 'Modifier la séparation par montant' : 'Ce marchand a deux usages différents (ex. courses et carburant) : séparer par le montant'}</button>` : ''}
       <div class="field"><label>Compter comme</label><div class="seg" style="grid-template-columns:1fr 1fr 1fr" role="group" aria-label="Type">${[['ponct', 'Normal'], ['exc', 'Exceptionnel'], ['int', 'Entre mes comptes']].map(([k, l]) => `<button type="button" data-okind="${k}" aria-pressed="${kind === k}">${l}</button>`).join('')}</div>
       <div class="hint" id="kindHint">${kind === 'exc' ? 'Compté dans le solde, pas dans les habitudes ni les prévisions.' : kind === 'int' ? 'Épargne, livret, autre compte à toi : ni dépense ni revenu.' : 'Dépense ou rentrée courante : entre dans les habitudes.'}</div></div>` : ''}
     <div class="field"><label for="oD">Date</label><input id="oD" type="date" value="${esc(o.date)}"></div>
     ${!isVir && !isAdj ? `<button type="button" class="btn ghost" data-tofix="${esc(o.id)}">↻ C'est une charge ${amt > 0 ? 'ou une rentrée ' : ''}régulière : passer en fixe</button>` : ''}
     <div class="actions"><button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button><button class="btn" type="submit">Enregistrer</button></div>
+    <div id="confirmBox"></div></form>`);
+}
+// Séparer un même libellé bancaire en deux catégories selon le montant (ex. MAGASIN U : courses ou carburant)
+function seuilSheet(o) {
+  const acc = o.compte, key = keyOf(o.libelle), cur = seuilRule(acc, o.libelle), cats = catsOf(acc).map(c => c.nom);
+  const v = cur || { s: Math.round(Math.abs(num(o.montant) || 0)), bas: '', haut: o.categorie || '' };
+  openSheet(`<form class="form" id="seuilForm" data-acc="${esc(acc)}" data-key="${esc(key)}" novalidate>
+    <h2>Séparer « ${esc(nameOf(o))} » par le montant</h2>
+    <div class="hint">Utile quand la banque donne le même libellé à deux usages différents (ex. « MAGASIN U » pour les courses et le carburant). En dessous ou égal au seuil : une catégorie ; au-dessus : l'autre. S'applique tout de suite aux opérations déjà importées de ce marchand sur ce compte, et aux prochaines (import comme banque).</div>
+    <div class="field"><label for="seS">Seuil (€)</label><input id="seS" inputmode="decimal" value="${fr(v.s)}"></div>
+    <div class="two"><div class="field"><label for="seBas">Montant ≤ seuil</label><input id="seBas" list="seCl" value="${esc(v.bas)}" placeholder="Ex. Courses" autocomplete="off"></div>
+    <div class="field"><label for="seHaut">Montant &gt; seuil</label><input id="seHaut" list="seCl" value="${esc(v.haut)}" placeholder="Ex. Carburant" autocomplete="off"></div></div>
+    <datalist id="seCl">${cats.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    <div class="actions">${cur ? `<button type="button" class="btn danger" data-seuildel="${esc(acc)}|${esc(key)}">Ne plus séparer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
     <div id="confirmBox"></div></form>`);
 }
 function balSheet() {
@@ -1952,6 +2055,9 @@ document.addEventListener('click', ev => {
   if (ds.bn) { BIL.n = +ds.bn; store.set('le31-bil-n', BIL.n); render(); return; }
   if (ds.bmode) { BIL.mode = ds.bmode; store.set('le31-bil-mode', BIL.mode); render(); return; }
   if (ds.tofix) { const o = DB.operations.find(x => x.id === ds.tofix); if (o) { closeSheet(); fixFromOp(o); } return; }
+  if (ds.seuil2) { const o = DB.operations.find(x => x.id === ds.seuil2); if (o) seuilSheet(o); return; }
+  if (ds.seuildel) { const i = ds.seuildel.indexOf('|'), acc = ds.seuildel.slice(0, i), key = ds.seuildel.slice(i + 1); commit([upd('Parametres', { cle: 'seuilCat|' + acc + '|' + key, valeur: '' })]); closeSheet(); toast('Ce marchand n\'est plus séparé par le montant'); return; }
+  if (ds.payauto) { commit([upd('Parametres', { cle: 'payeFin|' + ds.payauto, valeur: '' })]); toast('Date de fin recalculée automatiquement'); return; }
   if (ds.pview) { P.view = ds.pview; store.set('le31-pview', P.view); render(); return; }
   if (ds.pm) { P.k = addM(P.k || CUR, +ds.pm); render(); return; }
   if (ds.pf) { P.f = ds.pf; render(); return; }
@@ -2026,6 +2132,9 @@ document.addEventListener('change', ev => {
   if (ds.mdep) { const v = el.value; if (/^\d{4}-\d{2}$/.test(v) && v <= CUR) { commit([upd('Comptes', { id: ds.mdep, moisDepart: v })]); toast('Mois de départ mis à jour'); } else toast('Choisis un mois passé ou le mois en cours'); return; }
   if (ds.prof) { const v = el.value.trim(); if (v) { commit([upd('Profils', { id: ds.prof, nom: v })]); toast(DB.profils.length > 1 ? 'Prénom changé pour tout le monde' : 'Prénom changé'); } return; }
   if (ds.tax) { const v = ds.tax === 'impAutresAb' ? el.value : num(el.value); if (v !== null && v !== '') commit([upd('Parametres', { cle: ds.tax, valeur: v })]); return; }
+  if (ds.payon) { commit([upd('Parametres', { cle: 'payeOn|' + ds.payon, valeur: el.checked ? 'oui' : 'non' })]); render(); return; }
+  if (ds.payfixe) { commit([upd('Parametres', { cle: 'payeFixe|' + ds.payfixe, valeur: el.value })]); render(); return; }
+  if (ds.payend) { const v = el.value; if (/^\d{4}-\d{2}-\d{2}$/.test(v)) { commit([upd('Parametres', { cle: 'payeFin|' + ds.payend, valeur: v })]); toast('Date de fin de la période mise à jour'); } return; }
 });
 document.addEventListener('submit', ev => {
   ev.preventDefault(); const f = ev.target;
@@ -2136,6 +2245,13 @@ document.addEventListener('submit', ev => {
       if (Object.keys(rf).length) ops.push(ruleOp(o.compte, sk(keyOf(o.libelle), num(o.montant)), rf));
     }
     commit(ops); closeSheet(); toast(n ? `Mis à jour, avec ${n} opération${n > 1 ? 's' : ''} du même marchand` : 'Opération mise à jour'); return;
+  }
+  if (f.id === 'seuilForm') {
+    const acc = f.dataset.acc, key = f.dataset.key, s = num($('seS').value), bas = $('seBas').value.trim(), haut = $('seHaut').value.trim();
+    if (s === null || s <= 0 || !bas || !haut) { toast('Indique un seuil et les deux catégories'); return; }
+    const ops = [...newCatOps(acc, bas), ...newCatOps(acc, haut), upd('Parametres', { cle: 'seuilCat|' + acc + '|' + key, valeur: JSON.stringify({ s: r2(s), bas, haut }) })];
+    DB.operations.filter(o => o.compte === acc && keyOf(o.libelle) === key && isPonct(o)).forEach(o => { const c = Math.abs(num(o.montant) || 0) > s ? haut : bas; if ((o.categorie || '') !== c) ops.push(upd('Operations', { id: o.id, categorie: c })); });
+    commit(ops); closeSheet(); toast('Séparation enregistrée'); return;
   }
   if (f.id === 'balForm') {
     const v = num($('realBal').value); if (v === null) { toast('Indique le solde de la banque'); return; }
