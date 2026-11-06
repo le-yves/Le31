@@ -1,14 +1,14 @@
-/* LE 31 — appli téléphone — V3.0
-   Pilotage par cycles de paie (logique du fichier Excel « Suivi budget ») : Perso du salaire à la veille du suivant,
-   Commun de l'arrivée du virement d'Adeline à la veille du suivant. Opérations lues à la banque (Enable Banking, V2),
-   classées à la main le premier cycle (« À classer »), puis automatiquement quand c'est sûr.
-   Données : Google Sheet via Google Apps Script (Code.gs 3.0). Lien d'accès à usage unique échangé contre un jeton. */
+/* LE 31 — appli téléphone — V3.1.1 (V3.0 + évolution du salaire, épargne, mois par mois ; aucune donnée personnelle dans le code)
+   Pilotage par cycles de paie : Perso du salaire à la veille du suivant, Commun de l'arrivée du virement de début de cycle
+   à la veille du suivant. Opérations lues à la banque (Enable Banking), classées à la main le premier cycle (« À classer »),
+   puis automatiquement quand c'est sûr. Données : Google Sheet via Google Apps Script (Code.gs 3.1). */
 'use strict';
-const APP_VERSION = '3.0';
+const APP_VERSION = '3.1.1';
 
 /* ================= Outils ================= */
 const MONTHS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
 const MONTHS_L = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+const MONTHS_C = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
 const FREQ = { M: 'Mensuel', T: 'Trimestriel', A: 'Annuel' };
 const $ = id => document.getElementById(id);
 const pad = n => String(n).padStart(2, '0');
@@ -107,7 +107,7 @@ async function join() {
 
 /* ================= Données ================= */
 const TABS = { comptes: 'Comptes', profils: 'Profils', parametres: 'Parametres', appareils: 'Appareils', attente: 'Attente', banque: 'Banque', banqueConf: 'BanqueConf',
-  mouvements: 'Mouvements', recurrents: 'Recurrents', cycles: 'Cycles', prevues: 'Prevues', budgets: 'Budgets', apprentissage: 'Apprentissage' };
+  mouvements: 'Mouvements', recurrents: 'Recurrents', cycles: 'Cycles', prevues: 'Prevues', budgets: 'Budgets', apprentissage: 'Apprentissage', livrets: 'Livrets', mvtsLivret: 'MvtsLivret', reglages: 'Reglages' };
 const EMPTY = () => { const o = {}; for (const k in TABS) o[k] = []; return o; };
 let RAW = store.get('le31-data', null);          // dernière copie reçue du serveur
 let QUEUE = store.get('le31-file', []);          // modifications pas encore envoyées
@@ -190,6 +190,7 @@ function received(data, moi) {
   const first = !LOADED; LOADED = true;
   rebuild(); setSync();
   ensurePerso();
+  migrate31();
   setTimeout(bankAuto, 0);
   if (first || before !== JSON.stringify(RAW) + ME) {
     // ne pas re-dessiner pendant qu'on tape dans un champ
@@ -235,7 +236,10 @@ const cycName = k => MONTHS_L[pm(k).m] + (pm(k).y !== pm(labelMonth(TODAY_ISO)).
 
 /* ================= Démarrage V3 d'un compte =================
    Parametres « v3|<compte> » = { debut: date de début du 1er cycle suivi, mois, montant (revenu du cycle), jour (jour habituel) } */
-const v3 = acc => { try { return JSON.parse(param('v3|' + acc, 'null')); } catch (e) { return null; } };
+// V3.1 : réglages privés d'un compte (onglet Reglages : id = compte|cle, valeur JSON) ; avant, « v3 » était dans Parametres (partagé)
+const regJ = (acc, k) => { const r = DB.reglages.find(x => x.id === acc + '|' + k); if (!r) return null; try { return JSON.parse(r.valeur); } catch (e) { return null; } };
+const regOp = (acc, k, v) => upd('Reglages', { id: acc + '|' + k, compte: acc, cle: k, valeur: JSON.stringify(v) });
+const v3 = acc => { const r = regJ(acc, 'v3'); if (r) return r; try { return JSON.parse(param('v3|' + acc, 'null')); } catch (e) { return null; } };
 const started3 = acc => !!(v3(acc) || {}).debut;
 const defJour = acc => num((v3(acc) || {}).jour) || 26;
 const salLabel = acc => isPerso(acc) ? 'Salaire' : (param('v3nomrev|' + acc, '') || 'Virement de début de cycle');
@@ -248,14 +252,15 @@ function cyclesOf(acc) {
   const S = v3(acc); if (!S || !S.debut) return (CACHE[ck] = []);
   const rows = {}; DB.cycles.filter(c => c.compte === acc).forEach(c => rows[c.mois] = c);
   const sal = {}; allMovs().filter(o => o.compte === acc && o.type === 'sal').forEach(o => { if (!sal[o.lien] || o.date < sal[o.lien].date) sal[o.lien] = o; });
-  const list = []; let k = S.mois, montant = num(S.montant) || 0;
+  const list = [], P = salPlan(acc); let k = S.mois, baseM = num(S.montant) || 0, baseK = S.mois;
   const n = Math.max(15, diffM(S.mois, labelMonth(TODAY_ISO)) + 15);
   for (let i = 0; i < n; i++) {
     const r = rows[k] || {}, so = sal[k], man = String(r.manuel || '');
     let debut = i === 0 ? S.debut : (man.includes('d') && r.debut) || (so && so.date) || r.debut || dayOn(addM(k, -1), defJour(acc));
     if (i > 0 && dDiff(list[i - 1].debut, debut) < 15) debut = addD(list[i - 1].debut, 15); // garde-fou : deux débuts trop proches
-    if (num(r.montant) !== null && r.montant !== '') montant = num(r.montant);
-    list.push({ i, acc, mois: k, debut, montant, row: r, sal: so || null, man, dateBanque: so ? so.date : '' });
+    if (man.includes('m') && num(r.montant) !== null && r.montant !== '') { baseM = num(r.montant); baseK = k; }
+    const X = expectedPay(P, baseM, baseK, k);
+    list.push({ i, acc, mois: k, debut, montant: X.total, base: X.base, detail: X, row: r, sal: so || null, man, dateBanque: so ? so.date : '' });
     k = addM(k, 1);
   }
   list.forEach((c, i) => c.fin = i + 1 < list.length ? addD(list[i + 1].debut, -1) : addD(c.debut, 30));
@@ -314,6 +319,10 @@ function cycleCalc(acc, c) {
         && ((key && (skOf(o) === key || keyOf(o.libelle || '') === key)) || dayGap(num(r.jour) || 1, +o.date.slice(8, 10)) <= 4))) seen++;
       const v = (r.sens === '+' ? 1 : -1) * m;
       occ.slice(seen).forEach(d => proj.push({ d: place(d), v, label: r.libelle, kind: 'fixe', id: r.id, cat: r.categorie, late: d <= TODAY_ISO, prevu: d }));
+    });
+    primeParts(acc, c.debut, c.fin).forEach(p => {
+      const seen = real.some(o => o.lien === p.key) || take(o => (num(o.montant) || 0) > 0 && Math.abs((num(o.montant) || 0) - p.v) <= 0.1 * p.v && Math.abs(dDiff(p.date, o.date)) <= 4);
+      if (!seen) proj.push({ d: place(p.date), v: p.v, label: p.nom, kind: 'prime', late: p.date <= TODAY_ISO, prevu: p.date });
     });
     DB.prevues.filter(p => p.compte === acc && !p.etat && p.date >= c.debut && p.date <= c.fin)
       .forEach(p => proj.push({ d: place(p.date), v: num(p.montant) || 0, label: p.libelle, kind: 'prev', id: p.id, cat: p.categorie, late: p.date <= TODAY_ISO, prevu: p.date }));
@@ -390,6 +399,114 @@ function simCredit(acc, base, cr) {
     return { c: x.c, n, end, base: x.end };
   });
   return { rows, ok: low >= 0, low: r2(low), impact: r2(cumOther - M * cumPay), nPay: cumPay, max: maxM === Infinity ? null : r2(Math.max(0, Math.floor(maxM * 100) / 100)) };
+}
+
+/* ================= V3.1 : évolution du salaire =================
+   Réglage « salaire » : { moisHausse: 6, rattrapDepuis: 1, hausses: { "2027": 2 }, primes: [{ id, nom, type: "paie"|"part", mois, jour, montants: { "2026": 2000 } }] }
+   La paie d'un mois ouvre le cycle du mois suivant (paie de juin → cycle de juillet). */
+const salPlan = acc => regJ(acc, 'salaire') || { moisHausse: 6, rattrapDepuis: 1, hausses: {}, primes: [] };
+const payMonth = k => addM(k, -1);
+// pourcentage d'une année : celui saisi, sinon le dernier saisi avant (les années suivantes le reprennent)
+function pctOf(P, y) {
+  const ys = Object.keys(P.hausses || {}).map(Number).filter(x => !isNaN(x)).sort((a, b) => a - b);
+  if (!ys.length || y < ys[0]) return 0;
+  const k = ys.filter(x => x <= y).pop(); return num(P.hausses[k]) || 0;
+}
+// montant d'une prime pour une année : celui saisi, sinon celui de l'année d'avant la plus proche
+function primeAmt(p, y) {
+  const m = p.montants || {}; const ys = Object.keys(m).map(Number).filter(x => x <= y && num(m[x]) > 0).sort((a, b) => a - b);
+  return ys.length ? num(m[ys.pop()]) : 0;
+}
+// Paie attendue pour le cycle k : salaire de base augmenté + rattrapage (paie de l'augmentation) + primes versées avec la paie
+function expectedPay(P, baseM, baseK, k) {
+  const mh = Math.min(12, Math.max(1, num(P.moisHausse) || 6)), rd = Math.min(mh, Math.max(1, num(P.rattrapDepuis) || 1));
+  const pk = payMonth(k), p0 = payMonth(baseK);
+  let base = baseM, rappel = 0, hausse = 0;
+  for (let y = +p0.slice(0, 4); y <= +pk.slice(0, 4); y++) {
+    const e = y + '-' + pad(mh), pc = pctOf(P, y);
+    if (!pc || e <= p0 || e > pk) continue;
+    const before = base; base = r2(base * (1 + pc / 100));
+    if (e === pk) { hausse = pc; rappel = r2((base - before) * (mh - rd)); }
+  }
+  const primes = (P.primes || []).filter(p => p.type !== 'part' && +p.mois === +pk.slice(5, 7)).map(p => ({ nom: p.nom, v: primeAmt(p, +pk.slice(0, 4)) })).filter(p => p.v > 0);
+  return { base: r2(base), rappel, hausse, primes, total: r2(base + rappel + primes.reduce((a, p) => a + p.v, 0)) };
+}
+// Primes versées à part (ex. ½ 13ème mois le 15 juin et le 15 décembre) entre a et b
+function primeParts(acc, a, b) {
+  const P = salPlan(acc), out = [];
+  (P.primes || []).filter(p => p.type === 'part').forEach(p => {
+    for (let y = +a.slice(0, 4); y <= +b.slice(0, 4); y++) {
+      const d = dayOn(y + '-' + pad(+p.mois || 12), +p.jour || 15), v = primeAmt(p, y);
+      if (d >= a && d <= b && v > 0) out.push({ id: p.id, nom: p.nom, date: d, v, key: 'pr|' + p.id + '|' + y });
+    }
+  });
+  return out;
+}
+
+/* ================= V3.1 : épargne =================
+   Livrets(compte = compte courant propriétaire, type livret|invest, pointZero au dateZero, objectif mensuel).
+   Un mouvement du compte courant alimente un livret : type « epargne » (livret choisi), fixe lié à un livret, prévue liée.
+   Sortie du compte = versement sur le livret ; rentrée depuis le livret = retrait. MvtsLivret : intérêts (recalage) et mouvements à la main. */
+const livretsOf = acc => DB.livrets.filter(l => l.compte === acc && l.actif !== 'non').sort((a, b) => (num(a.ordre) || 0) - (num(b.ordre) || 0));
+const livOf = id => DB.livrets.find(l => l.id === id);
+const livretOfMov = o => o.type === 'epargne' ? o.livret || '' : o.type === 'fixe' ? ((recOf(o.lien) || {}).livret || '') : o.livret || '';
+const monthEnd = k => k + '-' + pad(dim(k));
+function livFlows(L) {
+  const ck = 'lf|' + L.id; if (CACHE[ck]) return CACHE[ck];
+  const out = [];
+  DB.mouvements.filter(o => o.compte === L.compte && o.date > L.dateZero && livretOfMov(o) === L.id).forEach(o => { const v = r2(-(num(o.montant) || 0)); out.push({ date: o.date, v, kind: v >= 0 ? 'vers' : 'retr', label: nameOf(o), oid: o.id }); });
+  DB.mvtsLivret.filter(m => m.livret === L.id && m.date > L.dateZero).forEach(m => { const v = num(m.montant) || 0; out.push({ date: m.date, v, kind: m.type === 'interets' ? 'int' : v >= 0 ? 'vers' : 'retr', label: m.libelle || (m.type === 'interets' ? 'Intérêts' : 'Mouvement'), mid: m.id }); });
+  return (CACHE[ck] = out.sort((a, b) => a.date.localeCompare(b.date)));
+}
+// À venir sur un mois : fixes liés pas encore vus ce mois-là, prévues liées (mois en cours et suivants)
+function livProj(L, k) {
+  if (k < CUR) return [];
+  const a = k + '-01', b = monthEnd(k), out = [];
+  DB.recurrents.filter(r => r.compte === L.compte && r.livret === L.id).forEach(r => {
+    const occ = occDates(r, a, b), seen = DB.mouvements.filter(o => o.type === 'fixe' && o.lien === r.id && o.date >= a && o.date <= b).length;
+    occ.slice(seen).forEach(d => out.push({ date: d, v: (r.sens === '+' ? -1 : 1) * (num(r.montant) || 0), kind: r.sens === '+' ? 'retr' : 'vers', label: r.libelle, prevu: true }));
+  });
+  DB.prevues.filter(p => p.compte === L.compte && p.livret === L.id && !p.etat && p.date >= a && p.date <= b)
+    .forEach(p => { const v = -(num(p.montant) || 0); out.push({ date: p.date, v, kind: v >= 0 ? 'vers' : 'retr', label: p.libelle, prevu: true }); });
+  return out;
+}
+const livSolde = (L, iso) => r2((num(L.pointZero) || 0) + livFlows(L).filter(f => f.date <= iso).reduce((a, f) => a + f.v, 0));
+// Mois du livret : du mois qui suit le point zéro jusqu'à `last` ; réel jusqu'à aujourd'hui, prévu ensuite
+function livMonths(L, last) {
+  const ck = 'lm|' + L.id + '|' + last; if (CACHE[ck]) return CACHE[ck];
+  const out = []; let bal = num(L.pointZero) || 0;
+  for (let k = addM(L.dateZero.slice(0, 7), 1); k <= last; k = addM(k, 1)) {
+    const fl = livFlows(L).filter(f => f.date.slice(0, 7) === k), pr = livProj(L, k), all = fl.concat(pr);
+    const vers = r2(all.filter(f => f.kind === 'vers').reduce((a, f) => a + f.v, 0)), retr = r2(-all.filter(f => f.kind === 'retr').reduce((a, f) => a + f.v, 0)), int = r2(all.filter(f => f.kind === 'int').reduce((a, f) => a + f.v, 0));
+    const realNet = r2(fl.filter(f => f.kind !== 'int').reduce((a, f) => a + f.v, 0)), projNet = r2(pr.reduce((a, f) => a + f.v, 0));
+    bal = r2(bal + vers - retr + int);
+    out.push({ k, vers, retr, int, net: r2(vers - retr), fin: bal, realNet, projNet, real: fl, proj: pr, st: k < CUR ? 'real' : k === CUR ? 'cur' : 'fut' });
+  }
+  return (CACHE[ck] = out);
+}
+// objectif du mois : atteint (réel), à venir (réel + prévu), en retard
+function livObj(L, m) {
+  const o = num(L.objectif) || 0; if (!o || !m) return null;
+  return m.realNet >= o - 0.005 ? 'ok' : m.st !== 'real' && m.realNet + m.projNet >= o - 0.005 ? 'wait' : 'late';
+}
+
+/* ================= V3.1 : courbe (accueil et épargne) ================= */
+function lineSvg(pts, label) {
+  const ok = pts.filter(p => p.v !== null && p.v !== undefined); if (!ok.length) return '';
+  const W = 330, H = 180, x0 = 22, x1 = 306, yb = 150, yt = 22;
+  const vs = ok.map(p => p.v), mn = Math.min(0, ...vs), mx = Math.max(1, ...vs);
+  const X = i => pts.length < 2 ? (x0 + x1) / 2 : x0 + i * (x1 - x0) / (pts.length - 1), Y = v => yb - (v - mn) * (yb - yt) / (mx - mn || 1);
+  const seg = (a, b) => `M${X(a.i).toFixed(1)} ${Y(a.v).toFixed(1)} L${X(b.i).toFixed(1)} ${Y(b.v).toFixed(1)}`;
+  const P = pts.map((p, i) => Object.assign({ i }, p)).filter(p => p.v !== null && p.v !== undefined);
+  let solid = '', dash = '';
+  for (let j = 1; j < P.length; j++) { const s = seg(P[j - 1], P[j]); if (P[j].st === 'fut') dash += s + ' '; else solid += s + ' '; }
+  const dots = P.map(p => p.st === 'fut' ? `<circle cx="${X(p.i).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="3" fill="var(--surface)" stroke="${p.v < 0 ? 'var(--warn)' : 'var(--accent)'}" stroke-width="2"/>` : `<circle cx="${X(p.i).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="${p.st === 'cur' ? 5 : 3.5}" fill="${p.v < 0 ? 'var(--warn)' : 'var(--accent)'}"/>`).join('');
+  const labs = pts.map((p, i) => `<text x="${X(i).toFixed(1)}" y="170" text-anchor="middle">${esc(p.lab)}</text>`).join('');
+  const fmt = v => Math.round(v).toLocaleString('fr-FR');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">
+    <line x1="${x0}" y1="${Y(0).toFixed(1)}" x2="${x1}" y2="${Y(0).toFixed(1)}" class="zero"/>
+    ${solid ? `<path d="${solid}" class="ln"/>` : ''}${dash ? `<path d="${dash}" class="ln dash"/>` : ''}${dots}
+    <g class="lab">${labs}</g><g class="lab"><text x="${W - 2}" y="${(Y(mx) + 3).toFixed(1)}" text-anchor="end">${fmt(mx)}</text><text x="${W - 2}" y="${(Y(0) + 3).toFixed(1)}" text-anchor="end">0</text></g></svg>`;
 }
 /* ================= Import de relevé (CSV / OFX) ================= */
 const NORM = s => String(s || '').toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
@@ -485,10 +602,16 @@ function suggest(o) {
   const acc = o.compte, key = skOf(o), k0 = keyOf(o.libelle || ''), v = num(o.montant) || 0, a = Math.abs(v), neg = v < 0;
   const rule = ruleOf3(acc, key);
   if (rule && rule.type === 'ask') return { kind: 'ask', sure: false, why: 'Toujours demander pour ce marchand' };
-  if (!neg && rule && rule.type === 'sal') {
-    const exp = num(rule.montant) || a, ok = Math.abs(a - exp) <= 0.25 * exp;
-    return { kind: 'sal', sure: ok, why: ok ? '' : `Montant inhabituel (d'habitude ${eur(exp)})` };
+  if (!neg) { // prime versée à part (½ 13ème mois…) : montant à ± 10 %, date à ± 4 jours
+    const pp = primeParts(acc, addD(o.date, -4), addD(o.date, 4)).find(p => Math.abs(a - p.v) <= 0.1 * p.v && !allMovs().some(x => x.id !== o.id && x.lien === p.key));
+    if (pp) return { kind: 'prime', p: pp, sure: true, why: '' };
   }
+  if (!neg && rule && rule.type === 'sal') {
+    const c = cycleByMois(acc, labelMonth(o.date)), exp = c ? c.montant : (num(rule.montant) || a);
+    const ok = Math.abs(a - exp) <= 0.1 * exp || (!(c && (c.detail.rappel || c.detail.primes.length)) && Math.abs(a - (num(rule.montant) || exp)) <= 0.25 * (num(rule.montant) || exp));
+    return { kind: 'sal', sure: ok, why: ok ? '' : `Montant inhabituel (attendu ${eur(exp)})` };
+  }
+  if (rule && rule.type === 'epargne' && livOf(rule.categorie)) return { kind: 'epargne', livret: rule.categorie, sure: true, why: '' };
   const recs = DB.recurrents.filter(r => r.compte === acc && bool(r.actif) && (r.sens === '+') === !neg && (r.motif === key || r.motif === k0));
   if (recs.length) {
     const c = cycleAt(acc, o.date), day = +String(o.date).slice(8, 10);
@@ -502,6 +625,10 @@ function suggest(o) {
     const why = !cand.amtOk ? `Montant inhabituel (d'habitude ${eur(num(cand.r.montant))})` : !cand.free ? 'Déjà vue dans ce cycle' : !cand.dayOk ? `Date inhabituelle (d'habitude le ${cand.r.jour})` : '';
     return { kind: 'fixe', r: cand.r, sure, why };
   }
+  if (!rule) { // nom d'un livret dans le libellé : versement (débit) ou retrait (crédit), à confirmer
+    const nl = NORM(o.libelle || ''), L = livretsOf(acc).find(x => x.nom && nl.includes(NORM(x.nom)));
+    if (L) return { kind: 'epargne', livret: L.id, sure: false, why: '' };
+  }
   const sr = neg && seuilRule(acc, k0);
   if (sr) return { kind: 'ponct', cats: [a > num(sr.s) ? sr.haut : sr.bas], sure: true, why: '' };
   if (rule && rule.type === 'ponct') {
@@ -514,15 +641,17 @@ function suggest(o) {
 function autoClass(o) {
   const acc = o.compte, v = num(o.montant) || 0, a = Math.abs(v), S = v3(acc) || {}, ops = [];
   const pv = DB.prevues.find(p => p.compte === acc && !p.etat && Math.sign(num(p.montant) || 0) === Math.sign(v) && Math.abs(Math.abs(num(p.montant) || 0) - a) <= Math.max(0.01 * a, 1) && Math.abs(dDiff(p.date, o.date)) <= 4);
-  if (pv) { Object.assign(o, { type: 'ponct', categorie: pv.categorie || '', nom: pv.libelle, auto: '1' }); ops.push(upd('Prevues', { id: pv.id, etat: 'realisee', lien: o.id })); return ops; }
+  if (pv) { Object.assign(o, pv.livret ? { type: 'epargne', livret: pv.livret, categorie: pv.categorie || 'Épargne', nom: pv.libelle, auto: '1' } : { type: 'ponct', categorie: pv.categorie || '', nom: pv.libelle, auto: '1' }); ops.push(upd('Prevues', { id: pv.id, etat: 'realisee', lien: o.id })); return ops; }
   const c = cycleAt(acc, o.date), s = suggest(o);
   if (!s || !s.sure) return ops;
+  if (s.kind === 'prime') { Object.assign(o, { type: 'ponct', categorie: 'Primes', lien: s.p.key, nom: s.p.nom, auto: '1' }); return ops; }
   // le revenu du cycle suivant peut arriver avant la date estimée : accepté dès 15 jours après le début du suivi
   const allowed = (c && c.i >= 1) || (s.kind === 'sal' && S.debut && dDiff(S.debut, o.date) >= 15);
   if (!allowed) return ops;
   if (s.kind === 'sal') { Object.assign(o, { type: 'sal', lien: labelMonth(o.date), categorie: '', auto: '1' }); ops.push(...cycleDateOps(acc, o)); }
   else if (s.kind === 'fixe') Object.assign(o, { type: 'fixe', lien: s.r.id, categorie: s.r.categorie || '', nom: s.r.libelle, auto: '1' });
   else if (s.kind === 'ponct') { const r = ruleOf3(acc, skOf(o)); Object.assign(o, { type: 'ponct', categorie: s.cats[0], nom: (r && r.nom) || '', auto: '1' }); }
+  else if (s.kind === 'epargne') Object.assign(o, { type: 'epargne', livret: s.livret, categorie: 'Épargne', auto: '1' });
   return ops;
 }
 // Le revenu vu à la banque fixe la date de début (et le montant) du cycle, sauf si on les a saisis à la main
@@ -530,24 +659,28 @@ function cycleDateOps(acc, o) {
   const k = o.lien || labelMonth(o.date), S = v3(acc) || {}, id = acc + '|' + k;
   const r = DB.cycles.find(x => x.id === id) || {}, man = String(r.manuel || ''), row = { id, compte: acc, mois: k };
   if (k !== S.mois && !man.includes('d')) row.debut = o.date;
-  if (!man.includes('m')) row.montant = r2(Math.abs(num(o.montant) || 0));
   return Object.keys(row).length > 3 ? [upd('Cycles', row)] : [];
 }
 // Classement à la main (ou correction) : h = { type, categorie, nom, recId, newRec: {libelle, jour, montant}, ask }
 function classifyOps(o, h) {
   const acc = o.compte, key = skOf(o), ops = [], v = num(o.montant) || 0;
-  const row = { id: o.id, type: h.type, categorie: h.categorie || '', lien: '', auto: '', nom: h.nom || '' };
+  const row = { id: o.id, type: h.type === 'prime' ? 'ponct' : h.type, categorie: h.categorie || '', lien: '', auto: '', nom: h.nom || '', livret: '' };
   const rule = ruleOf3(acc, key), rid0 = rule ? rule.id : uid(), learn = f => ops.push(upd('Apprentissage', Object.assign({ id: rid0, compte: acc, cle: key }, rule ? {} : { type: '', categorie: '', nom: '', montant: '' }, f)));
   if (h.type === 'fixe') {
     let rid = h.recId;
     if (!rid) {
       rid = uid(); const c = cycleAt(acc, o.date);
-      ops.push(upd('Recurrents', { id: rid, compte: acc, libelle: h.newRec.libelle || nameOf(o), montant: r2(Math.abs(num(h.newRec.montant) || Math.abs(v))), sens: v > 0 ? '+' : '-', jour: num(h.newRec.jour) || +o.date.slice(8, 10), categorie: h.categorie || '', debut: c ? c.debut : o.date, fin: '', actif: 'oui', motif: key }));
+      ops.push(upd('Recurrents', { id: rid, compte: acc, libelle: h.newRec.libelle || nameOf(o), montant: r2(Math.abs(num(h.newRec.montant) || Math.abs(v))), sens: v > 0 ? '+' : '-', jour: num(h.newRec.jour) || +o.date.slice(8, 10), categorie: h.categorie || '', debut: c ? c.debut : o.date, fin: '', actif: 'oui', motif: key, livret: h.newRec.livret || '' }));
       row.nom = h.newRec.libelle || nameOf(o);
     } else {
       const r = recOf(rid); if (r) { if (r.motif !== key) ops.push(upd('Recurrents', { id: rid, motif: key })); row.categorie = h.categorie || r.categorie || ''; row.nom = r.libelle; }
     }
     row.lien = rid;
+  } else if (h.type === 'epargne') {
+    row.livret = h.livret || ''; row.categorie = h.categorie || 'Épargne';
+    learn({ type: 'epargne', categorie: h.livret || '' });
+  } else if (h.type === 'prime') {
+    row.lien = h.key; row.categorie = 'Primes'; row.nom = h.nom || '';
   } else if (h.type === 'sal') {
     row.lien = labelMonth(o.date); row.categorie = '';
     ops.push(...cycleDateOps(acc, Object.assign({}, o, { lien: row.lien })));
@@ -587,7 +720,7 @@ function ingest(acc, tx, solde, st) {
     // saisie à la main déjà là (même montant à ± 4 jours) : c'est la même opération
     const mo = manual.find(x => Math.abs((num(x.montant) || 0) - t.montant) < 0.01 && Math.abs(dDiff(x.date, t.date)) <= 4);
     if (mo) { manual.splice(manual.indexOf(mo), 1); stage([upd('Mouvements', { id: mo.id, ref, date: t.date })]); return; }
-    const o = { id: uid(), compte: acc, date: t.date, montant: r2(t.montant), libelle: String(t.libelle || '').slice(0, 120), nom: '', categorie: '', type: '', lien: '', auto: '', ref, profil: ME || '' };
+    const o = { id: uid(), compte: acc, date: t.date, montant: r2(t.montant), libelle: String(t.libelle || '').slice(0, 120), nom: '', categorie: '', type: '', lien: '', auto: '', ref, profil: ME || '', livret: '' };
     const extra = st ? [] : autoClass(o);
     stage([upd('Mouvements', o)].concat(extra));
     res.n++; if (o.auto) res.auto++; if (!o.type) res.todo++;
@@ -853,20 +986,21 @@ function ensurePerso() {
 
 /* ================= Interface ================= */
 const UI = { acc: store.get('le31-compte', ''), tab: 'home', txTab: 'ponct', txSeg: 'real', cyc: {}, jpj: store.get('le31-jpj', true), jpjAll: false,
-  td: {}, simTab: 'achat', theme: store.get('le31-theme', 'auto'), startAcc: {} };
+  td: {}, simTab: 'achat', theme: store.get('le31-theme', 'auto'), startAcc: {},
+  calTab: 'cyc', mpm: store.get('le31-mpm', 'g'), mpmOpen: store.get('le31-mpmo', false), epM: '', epL: '', epS: 'tot', epMpmOpen: store.get('le31-epmo', false), epMpm: store.get('le31-epmpm', 'g'), eplAll: false };
 const main = $('main');
-const VIEWS = { home: () => vHome(), todo: () => vTodo(), tx: () => vTx(), bud: () => vBud(), plus: () => vPlus(), cal: () => vCal(), sim: () => vSim(), set: () => vSet() };
+const VIEWS = { home: () => vHome(), todo: () => vTodo(), tx: () => vTx(), bud: () => vBud(), plus: () => vPlus(), cal: () => vCal(), sim: () => vSim(), set: () => vSet(), epa: () => vEpa(), epl: () => vEpl() };
 const todoCount = acc => DB.mouvements.filter(o => o.compte === acc && !o.type).length;
 function render() {
   refreshNow();
   if (!DB.comptes.find(a => a.id === UI.acc) && DB.comptes.length) UI.acc = accs()[0].id;
   $('foot').textContent = 'Le 31 · V' + APP_VERSION;
-  const tabOf = { cal: 'plus', sim: 'plus', set: 'plus' }[UI.tab] || UI.tab;
+  const tabOf = { cal: 'plus', sim: 'plus', set: 'plus', epa: 'plus', epl: 'plus' }[UI.tab] || UI.tab;
   document.querySelectorAll('nav.tabs button').forEach(b => b.setAttribute('aria-current', b.dataset.tab === tabOf));
   const blocked = BK.view === 'retour' ? null : gate();
   const bkv = !blocked && (BK.view || (bkPend() ? 'map' : null));
   $('tabs').hidden = !!blocked || !!bkv;
-  $('accSeg').hidden = !!blocked || !!bkv || accs().length < 2 || ['plus', 'set'].includes(UI.tab);
+  $('accSeg').hidden = !!blocked || !!bkv || accs().length < 2 || ['plus', 'set', 'epl'].includes(UI.tab);
   $('accSeg').innerHTML = accs().map(a => { const n = UI.tab === 'todo' ? todoCount(a.id) : 0; return `<button data-acc="${esc(a.id)}" aria-pressed="${a.id === UI.acc}">${esc(shortAcc(a.id))}${UI.tab === 'todo' ? ' · ' + n : ''}</button>`; }).join('');
   const nb = accs().reduce((a, x) => a + todoCount(x.id), 0), bd = $('todoBadge'); if (bd) { bd.textContent = nb; bd.hidden = !nb; }
   try { main.innerHTML = blocked || (bkv ? vBank() : (VIEWS[UI.tab] || VIEWS.home)()); }
@@ -908,6 +1042,7 @@ function gate() {
 
 /* ----- Outils d'affichage ----- */
 const money = v => `<span class="mono">${sgn(v)}</span>`;
+const nbM = v => (v < -0.004 ? '−' : '') + eur(Math.abs(v)).replace(/\s?€/, '');
 const eurM = v => (v < -0.004 ? '− ' : '') + eur(Math.abs(v)).replace(/\s?€/, '') + ' €';
 const selCycle = acc => (UI.cyc[acc] && cycleByMois(acc, UI.cyc[acc])) || curCycle(acc);
 function cycNav(acc, c) {
@@ -920,23 +1055,16 @@ function cycNav(acc, c) {
 const progBar = c => { const n = dDiff(c.debut, c.fin) + 1, k = Math.max(0, Math.min(n, dDiff(c.debut, TODAY_ISO) + 1)); return `<div class="prog"><i style="width:${Math.round(100 * k / n)}%"></i></div>`; };
 
 /* ----- Démarrage du suivi d'un compte ----- */
-// Données reprises du fichier Excel d'Yves-Marie (proposées au démarrage, modifiables ensuite)
-const EXCEL = {
-  perso: { debut: '2026-10-27', montant: 3277, jour: 26,
-    budgets: [['Alimentation', 100], ['Loisirs', 100], ['Barber', 40]],
-    cats: ['Abonnement', 'Sport', 'Crédit', 'Épargne', 'Investissement', 'Virement Commun', 'Divers'],
-    dates: { '2026-12': '2026-11-28', '2027-01': '2026-12-28', '2027-02': '2027-01-26', '2027-03': '2027-02-23', '2027-04': '2027-03-26', '2027-05': '2027-04-27' },
-    prevues: [['2026-12-15', '½ 13ème mois', 1700, 'Salaire'], ['2026-12-15', 'Économie → Livret A', -1200, 'Épargne']] },
-  commun: { debut: '2026-10-26', montant: 1900, jour: 26, nom: "Virement d'Adeline",
-    budgets: [['Courses', 500], ['Loisirs', 150], ['Centre aéré', 60], ['Carburant', 150], ['Cantine + périscolaire', 240]],
-    cats: ['Restaurants', 'Énergie', 'Assurances', 'Crédit', 'Abonnement', 'Impôts', 'Enfants', 'Aides', 'Épargne', 'Divers'], dates: {}, prevues: [] }
-};
+// Pré-remplissage facultatif du démarrage (window.LE31_PREFILL, absent de l'appli livrée : utilisé par les tests).
+// Forme : { label, perso: { qui (regex du prénom), debut, montant, jour, budgets, cats, dates, prevues, epargne, primes }, commun: { … } }
+const PREFILL = (typeof window !== 'undefined' && window.LE31_PREFILL) || null;
+const EPA_DEF = { perso: [['Livret A', 'livret'], ['LDD', 'livret'], ['Investissement', 'invest']], commun: [['Livret commun', 'livret']] };
 const CATS_DEF = ['Courses', 'Carburant', 'Restaurants', 'Loisirs', 'Shopping', 'Santé', 'Abonnement', 'Crédit', 'Épargne', 'Divers'];
-const excelFor = acc => EXCEL[isPerso(acc) ? 'perso' : 'commun'];
-const excelLikely = acc => !isPerso(acc) || /^yves/i.test(NORM(pname(accOf(acc).proprietaire)).toLowerCase());
+const excelFor = acc => (PREFILL && PREFILL[isPerso(acc) ? 'perso' : 'commun']) || null;
+const excelLikely = acc => { const X = excelFor(acc); return !!X && (!isPerso(acc) || !X.qui || new RegExp(X.qui, 'i').test(pname(accOf(acc).proprietaire))); };
 function defStart(acc) {
   const j = 26, d = TODAY >= j ? CUR + '-' + j : addM(CUR, -1) + '-' + j, X = excelFor(acc);
-  return excelLikely(acc) && labelMonth(X.debut) === labelMonth(d) ? X.debut : d;
+  return excelLikely(acc) && X.debut && labelMonth(X.debut) === labelMonth(d) ? X.debut : d;
 }
 function vStart(acc) {
   const P = isPerso(acc), X = excelFor(acc), ex = excelLikely(acc), bk = !!bkRow(acc), f = UI.startAcc[acc] || {};
@@ -945,12 +1073,12 @@ function vStart(acc) {
     <p class="hint" style="font-size:13px;margin:0">Le 31 suit ce compte par cycles : ${P ? 'du jour du salaire à la veille du suivant' : "de l'arrivée du virement de début de cycle à la veille du suivant"}. ${bk ? 'La banque est lue à partir du début du cycle (rien avant) et toutes les opérations arrivent dans « À classer ».' : ''}</p>
     <form class="form" id="startForm" data-acc="${esc(acc)}" novalidate>
       <div class="field"><label for="stD">${P ? 'Début du cycle en cours (jour du salaire)' : 'Début du cycle en cours (arrivée du virement)'}</label><input type="date" id="stD" value="${esc(f.debut || defStart(acc))}" max="${TODAY_ISO}"></div>
-      ${P ? '' : `<div class="field"><label for="stN">Nom de ce virement</label><input id="stN" value="${esc(f.nom || (ex ? X.nom : ''))}" placeholder="Ex. Virement d'Adeline"></div>`}
+      ${P ? '' : `<div class="field"><label for="stN">Nom de ce virement</label><input id="stN" value="${esc(f.nom || (ex ? X.nom : ''))}" placeholder="Ex. Virement du conjoint"></div>`}
       <div class="two"><div class="field"><label for="stM">${P ? 'Salaire net habituel (€)' : 'Montant habituel (€)'}</label><input id="stM" inputmode="decimal" value="${esc(f.montant != null ? f.montant : ex ? fr(X.montant) : '')}"></div>
       <div class="field"><label for="stJ">Jour habituel</label><input id="stJ" inputmode="numeric" value="${esc(f.jour || 26)}"></div></div>
       ${bk ? `<label class="check"><input type="checkbox" id="stBk" checked><span><b>Solde de départ lu à la banque</b><br><small class="mini">Recommandé : solde de la banque moins les opérations depuis le début du cycle.</small></span></label>` : ''}
       <div class="field" id="stSWrap" ${bk ? 'hidden' : ''}><label for="stS">Solde juste avant ${P ? 'le salaire' : 'le virement'} (€)</label><input id="stS" inputmode="decimal" placeholder="Ex. 0,00"></div>
-      <label class="check"><input type="checkbox" id="stX" ${ex ? 'checked' : ''}><span><b>Reprendre mon fichier Excel</b><br><small class="mini">${P ? 'Budgets (Alimentation 100, Loisirs 100, Barber 40), dates de salaire jusqu\'en mai, prévisions du 15/12 (½ 13ème mois, Économie).' : 'Budgets (Courses 500, Loisirs 150, Centre aéré 60, Carburant 150, Cantine 240).'} Les charges fixes, elles, viennent de ton classement.</small></span></label>
+      ${ex ? `<label class="check"><input type="checkbox" id="stX" checked><span><b>${esc(PREFILL.label || 'Pré-remplir')}</b><br><small class="mini">Budgets, dates et prévues proposés. Les charges fixes viennent de ton classement.</small></span></label>` : ''}
       <button class="btn" type="submit" ${BK.busy ? 'disabled' : ''}>${BK.busy ? '<span class="spin"></span> Lecture de la banque…' : 'Démarrer'}</button>
     </form></div></section>`;
 }
@@ -960,7 +1088,8 @@ async function startAccount(acc) {
   const bk = $('stBk') && $('stBk').checked, s = num($('stS').value);
   if (!bk && s === null) { toast('Indique le solde de départ'); return; }
   const S = { debut: d, mois: labelMonth(d), montant: m === null ? '' : r2(m), jour: j };
-  const ops = [upd('Parametres', { cle: 'v3|' + acc, valeur: JSON.stringify(S) })];
+  const ops = [isPerso(acc) ? regOp(acc, 'v3', S) : upd('Parametres', { cle: 'v3|' + acc, valeur: JSON.stringify(S) })];
+  if (isPerso(acc) && !DB.reglages.some(r => r.id === acc + '|salaire')) ops.push(regOp(acc, 'salaire', defaultPlan(acc, $('stX') && $('stX').checked)));
   if ($('stN') && $('stN').value.trim()) ops.push(upd('Parametres', { cle: 'v3nomrev|' + acc, valeur: $('stN').value.trim() }));
   ops.push(upd('Cycles', { id: acc + '|' + S.mois, compte: acc, mois: S.mois, debut: d, montant: S.montant, soldeDepart: bk ? '' : r2(s), manuel: bk ? '' : 's' }));
   const X = $('stX') && $('stX').checked ? excelFor(acc) : null;
@@ -995,6 +1124,7 @@ function vHome() {
     </div>
     ${nTodo ? `<button class="todoline" data-tab="todo"><span><b>${nTodo}</b> opération${nTodo > 1 ? 's' : ''} à classer</span><span>›</span></button>` : ''}
     ${vJpj(acc, c, R)}
+    ${vMpm(acc)}
   </section>`;
 }
 function vJpj(acc, c, R) {
@@ -1035,20 +1165,24 @@ function vTodo() {
 }
 function todoRow(o) {
   const s = suggest(o), v = num(o.montant) || 0;
-  return `<div class="todorow"><div class="tl"><b>${esc(o.libelle)}</b><span class="mono mini">${wd(o.date)} ${fmtJ(o.date)}</span>${s && s.why ? `<span class="sug">${esc(s.why)}</span>` : s && s.kind === 'fixe' ? `<span class="sug">Fixe « ${esc(s.r.libelle)} » ?</span>` : ''}</div>
-    <div class="tr"><span class="mono ${v > 0 ? 'pos' : ''}">${sgn(v)}</span><span class="qb2"><button class="qb" data-tsel="${esc(o.id)}" data-tk="ponct">Ponctuel</button><button class="qb" data-tsel="${esc(o.id)}" data-tk="${v > 0 && !s ? 'sal' : 'fixe'}">${v > 0 && !s ? 'Revenu' : 'Fixe'}</button></span></div></div>`;
+  return `<div class="todorow"><div class="tl"><b>${esc(o.libelle)}</b><span class="mono mini">${wd(o.date)} ${fmtJ(o.date)}</span>${s && s.why ? `<span class="sug">${esc(s.why)}</span>` : s && s.kind === 'fixe' ? `<span class="sug">Fixe « ${esc(s.r.libelle)} » ?</span>` : s && s.kind === 'epargne' ? `<span class="sug">Épargne · ${livName(livOf(s.livret))} ?</span>` : ''}</div>
+    <div class="tr"><span class="mono ${v > 0 ? 'pos' : ''}">${sgn(v)}</span><span class="qb2"><button class="qb" data-tsel="${esc(o.id)}" data-tk="ponct">Ponctuel</button>${s && s.kind === 'epargne' ? `<button class="qb" data-tsel="${esc(o.id)}" data-tk="epargne">Épargne</button>` : `<button class="qb" data-tsel="${esc(o.id)}" data-tk="${v > 0 && !s ? 'sal' : 'fixe'}">${v > 0 && !s ? 'Revenu' : 'Fixe'}</button>`}</span></div></div>`;
 }
 function todoCard(o) {
   const acc = o.compte, v = num(o.montant) || 0, s = suggest(o), T = UI.td;
-  if (!T.kind) T.kind = s && (s.kind === 'fixe' || s.kind === 'sal') ? s.kind : 'ponct';
+  const Ls = livretsOf(acc);
+  if (T.liv === undefined) T.liv = s && s.kind === 'epargne' ? s.livret : ((Ls.find(L => NORM(o.libelle || '').includes(NORM(L.nom))) || {}).id || '');
+  if (!T.kind) T.kind = s && (s.kind === 'fixe' || s.kind === 'sal' || s.kind === 'prime' || s.kind === 'epargne') ? s.kind : T.liv && Ls.length ? 'epargne' : 'ponct';
   if (T.cat === undefined) T.cat = s && s.kind === 'ponct' && s.cats.length === 1 ? s.cats[0] : s && s.kind === 'fixe' ? (s.r.categorie || '') : (ruleOf3(acc, skOf(o)) || {}).categorie && !String(ruleOf3(acc, skOf(o)).categorie).includes('|') ? ruleOf3(acc, skOf(o)).categorie : '';
   if (T.rec === undefined) T.rec = s && s.kind === 'fixe' ? s.r.id : '';
   const cats = catNames(acc), recs = DB.recurrents.filter(r => r.compte === acc && bool(r.actif) && (r.sens === '+') === (v > 0));
-  const kinds = [['ponct', 'Ponctuel'], ['fixe', 'Fixe']].concat(v > 0 ? [['sal', isPerso(acc) ? 'Salaire' : 'Début de cycle']] : []);
+  const kinds = [['ponct', 'Ponctuel'], ['fixe', 'Fixe']].concat(v > 0 ? [['sal', isPerso(acc) ? 'Salaire' : 'Début de cycle']] : []).concat(Ls.length ? [['epargne', 'Épargne']] : []).concat(s && s.kind === 'prime' ? [['prime', 'Prime']] : []);
   const rule = ruleOf3(acc, skOf(o));
   let sugg = '';
   if (s && s.kind === 'fixe') sugg = `<div class="sug">Fixe « ${esc(s.r.libelle)} » ?${s.why ? ' ' + esc(s.why) : ''}</div>`;
   else if (s && s.kind === 'sal') sugg = `<div class="sug">${esc(salLabel(acc))} ?${s.why ? ' ' + esc(s.why) : ''}</div>`;
+  else if (s && s.kind === 'prime') sugg = `<div class="sug">${esc(s.p.nom)} du ${fmtJ(s.p.date)} ?</div>`;
+  else if (s && s.kind === 'epargne') sugg = `<div class="sug">Épargne · ${livName(livOf(s.livret))} ?</div>`;
   else if (s && s.why) sugg = `<div class="sug">${esc(s.why)}</div>`;
   const chips = `<div class="chips" id="tdCats">${cats.map(n => `<button type="button" class="chip" data-tcat="${esc(n)}" aria-pressed="${T.cat === n}">${esc(n)}</button>`).join('')}<button type="button" class="chip" data-tcat="__new" aria-pressed="${T.cat === '__new'}">+ Nouvelle</button></div>
     <input id="tdCatNew" placeholder="Nouvelle catégorie" ${T.cat === '__new' ? '' : 'hidden'} value="${esc(T.catNew || '')}">`;
@@ -1061,7 +1195,13 @@ function todoCard(o) {
     body = `<div class="field"><label for="tdRec">Charge fixe</label><select id="tdRec">${recs.map(r => `<option value="${esc(r.id)}" ${r.id === T.rec ? 'selected' : ''}>${esc(r.libelle)} · le ${esc(r.jour)} · ${eurM(num(r.montant))}</option>`).join('')}<option value="" ${nr ? 'selected' : ''}>Nouvelle charge fixe…</option></select></div>
     ${nr ? `<div class="field"><label for="tdNom">Nom</label><input id="tdNom" value="${esc(T.nom != null ? T.nom : nameOf(o))}"></div>
       <div class="two"><div class="field"><label for="tdJour">Jour du mois</label><input id="tdJour" inputmode="numeric" value="${esc(T.jour || +o.date.slice(8, 10))}"></div><div class="field"><label for="tdMt">Montant habituel (€)</label><input id="tdMt" inputmode="decimal" value="${esc(T.mt != null ? T.mt : fr(Math.abs(v)))}"></div></div>` : ''}
+    ${nr && v < 0 ? livSelect(acc, T.liv, 'tdLiv') : ''}
     <div class="field"><label>Catégorie</label>${chips}</div>`;
+  } else if (T.kind === 'epargne') {
+    body = `<div class="field"><label>${v < 0 ? 'Versement vers' : 'Retrait depuis'}</label><div class="chips">${Ls.map(L => `<button type="button" class="chip" data-tliv="${esc(L.id)}" aria-pressed="${T.liv === L.id}">${livName(L)}</button>`).join('')}</div></div>
+      <div class="hint">${v < 0 ? 'Le livret augmente de ' + eurM(-v) : 'Le livret baisse de ' + eurM(v) + ', ton compte monte'}. Pour un virement qui revient chaque mois, choisis plutôt « Fixe » et lie-le au livret : il sera reconnu seul ensuite.</div>`;
+  } else if (T.kind === 'prime') {
+    body = `<div class="note">Reconnue comme <b>${esc(s.p.nom)}</b> du ${fmtJA(s.p.date)} (attendu ${eurM(s.p.v)}), réglée dans Calendrier salaires → Évolution du salaire.</div>`;
   } else {
     const k = labelMonth(o.date);
     body = `<div class="note">Début du cycle ${deMois(k)} le <b>${fmtJ(o.date)}</b>, montant <b>${eurM(v)}</b> : repris dans le Calendrier salaires${(cycleByMois(acc, k) || { man: '' }).man.includes('d') ? ' (sauf la date, saisie à la main)' : ''}.</div>`;
@@ -1082,14 +1222,16 @@ function readTodo(o) {
   if (T.kind === 'ponct') { h.nom = $('tdNom') ? $('tdNom').value.trim() : ''; if (h.nom === smartName(o.libelle || '')) h.nom = ''; }
   if (T.kind === 'fixe') {
     h.recId = $('tdRec') ? $('tdRec').value : '';
-    if (!h.recId) h.newRec = { libelle: ($('tdNom').value || '').trim() || nameOf(o), jour: num($('tdJour').value), montant: num($('tdMt').value) };
+    if (!h.recId) h.newRec = { libelle: ($('tdNom').value || '').trim() || nameOf(o), jour: num($('tdJour').value), montant: num($('tdMt').value), livret: $('tdLiv') ? $('tdLiv').value : '' };
   }
+  if (T.kind === 'epargne') { h.livret = T.liv || ''; h.categorie = 'Épargne'; }
+  if (T.kind === 'prime') { const s = suggest(o); if (s && s.kind === 'prime') { h.key = s.p.key; h.nom = s.p.nom; } }
   return h;
 }
 function keepTodoInputs() {
   const T = UI.td;
   if ($('tdNom')) T.nom = $('tdNom').value; if ($('tdJour')) T.jour = $('tdJour').value; if ($('tdMt')) T.mt = $('tdMt').value;
-  if ($('tdRec')) T.rec = $('tdRec').value; if ($('tdCatNew')) T.catNew = $('tdCatNew').value;
+  if ($('tdRec')) T.rec = $('tdRec').value; if ($('tdCatNew')) T.catNew = $('tdCatNew').value; if ($('tdLiv')) T.liv = $('tdLiv').value;
 }
 
 /* ----- Transactions (Ponctuels | Fixes) ----- */
@@ -1125,7 +1267,7 @@ function vFixes(acc, c, R, head) {
     const sv = seen.reduce((a, o) => a + (num(o.montant) || 0), 0), rest = occ.slice(seen.length);
     tot += sv + rest.length * sgnV * (num(r.montant) || 0); seenN += seen.length; waitN += rest.length;
     const st = !bool(r.actif) ? '<span class="mini">arrêtée</span>' : seen.length ? `<span class="ok">✓ vu le ${seen.map(o => fmtJ(o.date)).join(', ')}</span>` : rest.length ? `<span class="mini">${rest[0] <= TODAY_ISO ? 'pas encore vu (prévu le ' + fmtJ(rest[0]) + ')' : 'à venir'}</span>` : '<span class="mini">pas dans ce cycle</span>';
-    return `<button class="item ${!bool(r.actif) ? 'off' : ''}" data-rid="${esc(r.id)}"><span class="day">${pad(num(r.jour) || 1)}</span><span class="lbl"><b>${esc(r.libelle)}</b><small>${st}${r.categorie ? ' · ' + esc(r.categorie) : ''}${r.fin ? ' · jusqu\'au ' + fmtJA(r.fin) : ''}</small></span><span class="amt ${r.sens === '+' ? 'pos' : ''}">${r.sens === '+' ? '+' : '−'} ${eurM(num(r.montant) || 0)}</span></button>`;
+    return `<button class="item ${!bool(r.actif) ? 'off' : ''}" data-rid="${esc(r.id)}"><span class="day">${pad(num(r.jour) || 1)}</span><span class="lbl"><b>${esc(r.libelle)}</b><small>${st}${r.categorie ? ' · ' + esc(r.categorie) : ''}${r.livret && livOf(r.livret) ? ' · → ' + livName(livOf(r.livret)) : ''}${r.fin ? ' · jusqu\'au ' + fmtJA(r.fin) : ''}</small></span><span class="amt ${r.sens === '+' ? 'pos' : ''}">${r.sens === '+' ? '+' : '−'} ${eurM(num(r.montant) || 0)}</span></button>`;
   };
   const ins = recs.filter(r => r.sens === '+'), outs = recs.filter(r => r.sens !== '+');
   const html = [ins.length ? `<div class="grp">RENTRÉES</div>${ins.map(row).join('')}` : '', outs.length ? `<div class="grp">CHARGES ET VIREMENTS</div>${outs.map(row).join('')}` : ''].join('');
@@ -1158,7 +1300,8 @@ function vPlus() {
   const bk = bkOn() && bkLinked().length;
   return `<section class="view"><h2 class="title">Plus</h2>
     <div class="sublbl">PILOTAGE</div><div class="list">
-      ${it('cal', '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>', 'Calendrier salaires', 'Dates, salaires, soldes de départ')}
+      ${it('cal', '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>', 'Calendrier salaires', 'Cycles, augmentations, primes')}
+      ${it('epa', '<path d="M4 10h16v10H4z"/><path d="M12 4l8 6H4z"/><path d="M12 13v4M9.5 15h5"/>', 'Épargne', 'Livrets et investissement, objectifs du mois')}
       ${it('sim', '<path d="M3 20h18M6 16v-5M11 16V7M16 16v-3M21 4l-5 5"/>', 'Simulation', 'Tester un achat ou un crédit')}
     </div>
     <div class="sublbl">RÉGLAGES</div><div class="list">
@@ -1171,19 +1314,21 @@ const backPlus = `<button class="back" data-tab="plus">‹ Plus</button>`;
 /* ----- Calendrier salaires ----- */
 function vCal() {
   const acc = UI.acc; if (!started3(acc)) return backPlus + vStart(acc);
+  if (isPerso(acc) && UI.calTab === 'evo') return vEvo(acc);
   const cy = cyclesOf(acc), cur = curCycle(acc), P = isPerso(acc), S = v3(acc);
   const rows = cy.slice(0, cur.i + 12).map(c => {
     const R = cycleCalc(acc, c), isC = c.i === cur.i, k = departKind(c);
     const banque = c.sal ? `<span class="ok">✓ vu à la banque${c.man.includes('d') && c.sal.date !== c.debut ? ' le ' + fmtJ(c.sal.date) : ''}</span>` : c.debut > TODAY_ISO ? (c.row.debut ? '' : 'estimé') : c.i === 0 ? '' : '<span class="warnt">pas encore vu</span>';
-    return `<button class="cyrow ${isC ? 'cur' : ''}" data-cycm="${esc(c.mois)}"><span class="a"><b>${esc(MONTHS_L[pm(c.mois).m])}${pm(c.mois).y !== pm(S.mois).y ? ' ' + pm(c.mois).y : ''}${isC ? ' <i class="en">EN COURS</i>' : ''}</b><small><span class="mono">${fmtJ(c.debut)}</span> · ${eurM(c.montant).replace(',00', '')}${c.man.includes('d') ? ' · date saisie' : ''}${banque ? ' · ' + banque : ''}</small></span>
+    const xtra = [c.detail.rappel ? `+${c.detail.hausse} % et rattrapage` : '', ...c.detail.primes.map(p => '+ ' + p.nom)].filter(Boolean).join(' · ');
+    return `<button class="cyrow ${isC ? 'cur' : ''}" data-cycm="${esc(c.mois)}"><span class="a"><b>${esc(MONTHS_L[pm(c.mois).m])}${pm(c.mois).y !== pm(S.mois).y ? ' ' + pm(c.mois).y : ''}${isC ? ' <i class="en">EN COURS</i>' : ''}</b><small><span class="mono">${fmtJ(c.debut)}</span> · ${eurM(c.montant).replace(',00', '')}${xtra ? ' <b class="acc2">' + esc(xtra) + '</b>' : ''}${c.man.includes('d') ? ' · date saisie' : ''}${banque ? ' · ' + banque : ''}</small></span>
       <span class="b"><span class="mono">${eurM(R.depart)} → ${eurM(R.isPast ? R.realEnd : R.atterAvec)}</span><small>départ : ${esc(k)}</small></span></button>`;
   }).join('');
-  return `<section class="view">${backPlus}<h2 class="title">Calendrier salaires</h2>
+  return `<section class="view">${backPlus}<h2 class="title">Calendrier salaires</h2>${calTabs(acc)}
     <p class="hint" style="font-size:13px;margin:-8px 0 0">${P ? 'Un cycle va du jour du salaire à la veille du suivant.' : `Le cycle commence à l'arrivée du ${esc(salLabel(acc).toLowerCase().startsWith('virement') ? salLabel(acc) : 'virement')} ; tant qu'il n'est pas arrivé, la date est estimée au ${defJour(acc)}.`} Touche un cycle pour modifier sa date, son montant ou son solde de départ.</p>
     <div class="list"><div class="cyrow h"><span>CYCLE · ${P ? 'SALAIRE' : esc(salLabel(acc).toUpperCase())}</span><span>DÉPART → ARRIVÉE</span></div>${rows}</div>
     <div class="hero" style="gap:10px"><h2>Réglages du cycle</h2>
       <div class="two"><div class="field"><label for="cfJ">Jour habituel (estimation)</label><input id="cfJ" data-cfj="${esc(acc)}" inputmode="numeric" value="${esc(defJour(acc))}"></div>
-      ${P ? '' : `<div class="field"><label for="cfN">Nom du virement</label><input id="cfN" data-cfn="${esc(acc)}" value="${esc(param('v3nomrev|' + acc, ''))}" placeholder="Virement d'Adeline"></div>`}</div>
+      ${P ? '' : `<div class="field"><label for="cfN">Nom du virement</label><input id="cfN" data-cfn="${esc(acc)}" value="${esc(param('v3nomrev|' + acc, ''))}" placeholder="Ex. Virement du conjoint"></div>`}</div>
       <div class="hint">Début du suivi : ${fmtJA(S.debut)}. Les opérations d'avant ne sont pas lues.</div></div></section>`;
 }
 
@@ -1240,6 +1385,207 @@ function vSim() {
   return `<section class="view">${backPlus}<h2 class="title">Simulation</h2>${seg}${body}</section>`;
 }
 
+/* ================= V3.1 : mois par mois (accueil) ================= */
+const iniM = k => MONTHS_L[pm(k).m].charAt(0).toUpperCase();
+const mpmSeg = (attr, cur) => `<div class="seg"><button data-${attr}="g" aria-pressed="${cur !== 'y'}">12 mois glissants</button><button data-${attr}="y" aria-pressed="${cur === 'y'}">Année ${pm(CUR).y}</button></div>`;
+const legend = `<div class="legend"><span><i class="dot"></i>en cours / réel</span><span><i class="dsh"></i>prévu</span></div>`;
+function vMpm(acc) {
+  const cy = cyclesOf(acc), cur = curCycle(acc), y = pm(labelMonth(TODAY_ISO)).y;
+  const L = (UI.mpm === 'y' ? Array.from({ length: 12 }, (_, i) => y + '-' + pad(i + 1)).map(k => ({ k, c: cy.find(c => c.mois === k) || null })) : cy.slice(cur.i, cur.i + 12).map(c => ({ k: c.mois, c })))
+    .map(x => { if (!x.c) return { k: x.k, v: null }; const R = cycleCalc(acc, x.c); return { k: x.k, c: x.c, v: R.isPast ? R.realEnd : R.atterAvec, d: R.depart, st: R.isPast ? 'real' : R.isCur ? 'cur' : 'fut' }; });
+  const ok = L.filter(x => x.v !== null), low = ok.reduce((m, x) => !m || x.v < m.v ? x : m, null), neg = ok.find(x => x.v < 0);
+  const rows = L.map(x => x.v === null ? `<div class="mrow off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini">avant le suivi</span><span></span></div>`
+    : `<button class="mrow ${x.st}" data-gocyc="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono mini">${nbM(x.d)} → ${nbM(x.v)}</span><span class="mono ${x.v - x.d >= 0 ? 'pos' : 'warnt'}">${sgn(r2(x.v - x.d))}</span></button>`).join('');
+  return `<details class="jpj" id="mpm" ${UI.mpmOpen ? 'open' : ''}><summary>Mois par mois<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></summary>
+    <div class="mpmbody">${mpmSeg('mpm', UI.mpm)}
+    <div class="mini">Atterrissage avec budget, fin de chaque cycle${neg ? ` · <b class="warnt">▼ négatif en ${esc(MONTHS_L[pm(neg.k).m])}</b>` : low ? ` · point le plus bas : <b class="mono">${eurM(low.v)}</b> en ${esc(MONTHS_L[pm(low.k).m])}` : ''}</div>
+    ${lineSvg(L.map(x => ({ lab: iniM(x.k), v: x.v, st: x.st })), 'Atterrissage avec budget, mois par mois')}${legend}
+    <div class="mrows">${rows}</div><p class="hint">Touche un mois pour ouvrir son cycle.</p></div></details>`;
+}
+
+/* ================= V3.1 : Calendrier > Évolution du salaire ================= */
+const calTabs = acc => isPerso(acc) ? `<div class="ultabs"><button data-caltab="cyc" aria-pressed="${UI.calTab !== 'evo'}">Cycles</button><button data-caltab="evo" aria-pressed="${UI.calTab === 'evo'}">Évolution du salaire</button></div>` : '';
+const monthSel = (id, v, attrs) => `<select id="${id}" ${attrs}>${MONTHS_L.map((m, i) => `<option value="${i + 1}" ${+v === i + 1 ? 'selected' : ''}>${m}</option>`).join('')}</select>`;
+function defaultPlan(acc, excel) {
+  const P = { moisHausse: 6, rattrapDepuis: 1, hausses: {}, primes: [] };
+  // primes habituelles (bonus sur la paie de mars, ½ 13ème mois de juin et de décembre), sans montant : une prime sans montant ne compte pas
+  const pf = excel !== false && excelLikely(acc) && isPerso(acc) ? excelFor(acc).primes || {} : {};
+  P.primes = [
+    { id: uid(), nom: 'Bonus', type: 'paie', mois: 3, jour: '', montants: pf.bonus || {} },
+    { id: uid(), nom: '½ 13ème mois', type: 'part', mois: 6, jour: 15, montants: pf.juin || {} },
+    { id: uid(), nom: '½ 13ème mois', type: 'part', mois: 12, jour: 15, montants: pf.dec || {} }];
+  return P;
+}
+function vEvo(acc) {
+  const P = salPlan(acc), cy = cyclesOf(acc), cur = curCycle(acc), mh = num(P.moisHausse) || 6;
+  const ys = Object.keys(P.hausses || {}).map(Number).sort((a, b) => a - b);
+  const payOf = y => cy.find(c => payMonth(c.mois) === y + '-' + pad(mh));
+  const hRows = ys.map(y => { const c = payOf(y), d = c && c.detail;
+    return `<div class="evrow"><span class="y"><b>${y}</b><small>${d && d.rappel ? `Paie de ${MONTHS_L[mh - 1]} : ${eurM(d.base)} + rattrapage ${eurM(d.rappel)}` : 'hors des 12 prochains mois'}</small></span>
+      <span class="evin"><input id="evh${y}" data-evoh="${y}" inputmode="decimal" value="${esc(fr(P.hausses[y]))}" aria-label="Augmentation ${y} en %"><i>%</i></span>
+      ${d && d.rappel ? `<span class="mono tot">${eurM(d.base + d.rappel)}</span>` : '<span></span>'}<button class="x" data-evohdel="${y}" aria-label="Retirer ${y}">×</button></div>`; }).join('');
+  const nextYear = p => { if (p.type === 'part') { for (let y = pm(CUR).y; y < pm(CUR).y + 3; y++) if (dayOn(y + '-' + pad(+p.mois || 12), +p.jour || 15) >= TODAY_ISO) return y; } const pmNow = payMonth(cur.mois); return +p.mois >= +pmNow.slice(5, 7) && +pmNow.slice(0, 4) === pm(CUR).y ? pm(pmNow).y : pm(pmNow).y + (+p.mois < +pmNow.slice(5, 7) ? 1 : 0); };
+  const pRows = (P.primes || []).map(p => { const y = nextYear(p), m = (p.montants || {})[y];
+    return `<div class="evp"><div class="two"><div class="field"><label for="epn${p.id}">Prime</label><input id="epn${p.id}" data-evp="${esc(p.id)}" data-f="nom" value="${esc(p.nom)}"></div>
+      <div class="field"><label for="ept${p.id}">Versée</label><select id="ept${p.id}" data-evp="${esc(p.id)}" data-f="type"><option value="paie" ${p.type !== 'part' ? 'selected' : ''}>dans la paie</option><option value="part" ${p.type === 'part' ? 'selected' : ''}>virement à part</option></select></div></div>
+      <div class="two"><div class="field"><label for="epm${p.id}">${p.type === 'part' ? 'Mois' : 'Sur la paie de'}</label>${monthSel('epm' + p.id, p.mois, `data-evp="${esc(p.id)}" data-f="mois"`)}</div>
+      ${p.type === 'part' ? `<div class="field"><label for="epj${p.id}">Jour</label><input id="epj${p.id}" data-evp="${esc(p.id)}" data-f="jour" inputmode="numeric" value="${esc(p.jour || 15)}"></div>` : '<span></span>'}</div>
+      <div class="evrow" style="border:0;padding:4px 0 0"><span class="y"><b>${y}</b><small>${m === undefined || m === '' ? (primeAmt(p, y) ? 'repris : ' + eurM(primeAmt(p, y)) : 'montant à saisir') : 'saisi'}</small></span>
+      <span class="evin"><input id="epv${p.id}" data-evpm="${esc(p.id)}" data-y="${y}" inputmode="decimal" value="${m !== undefined && m !== '' ? esc(fr(m)) : ''}" placeholder="${primeAmt(p, y) ? esc(fr(primeAmt(p, y))) : 'à saisir'}" aria-label="Montant ${esc(p.nom)} ${y}"><i>€</i></span><span></span>
+      <button class="x" data-evpdel="${esc(p.id)}" aria-label="Retirer la prime">×</button></div></div>`; }).join('');
+  // ce que Le 31 attend à la banque (12 prochains mois)
+  const exp = []; cy.slice(cur.i + 1, cur.i + 13).forEach(c => { const d = c.detail; if (d.rappel || d.primes.length) exp.push({ date: c.debut, lab: `paie de ${MONTHS_L[pm(payMonth(c.mois)).m]}${d.rappel ? ' + augmentation' : ''}${d.primes.length ? ' + ' + d.primes.map(p => p.nom.toLowerCase()).join(', ') : ''}`, det: `${eurM(d.base)}${d.rappel ? ' + rattrapage ' + eurM(d.rappel) : ''}${d.primes.map(p => ' + ' + eurM(p.v)).join('')}`, v: c.montant, est: !c.row.debut }); });
+  primeParts(acc, TODAY_ISO, addD(TODAY_ISO, 366)).forEach(p => exp.push({ date: p.date, lab: p.nom, det: 'virement à part', v: p.v }));
+  (P.primes || []).filter(p => p.type === 'part').forEach(p => { const y = nextYear(p), d = dayOn(y + '-' + pad(+p.mois || 12), +p.jour || 15); if (!primeAmt(p, y) && d <= addD(TODAY_ISO, 366)) exp.push({ date: d, lab: p.nom, det: 'montant à saisir', v: null }); });
+  exp.sort((a, b) => a.date.localeCompare(b.date));
+  return `<section class="view">${backPlus}<h2 class="title">Calendrier salaires</h2>${calTabs(acc)}
+    <div class="hero" style="gap:10px"><div class="rowhead"><h2>Augmentation annuelle</h2><span class="mini" style="text-align:right">salaire actuel<br><b class="mono" style="white-space:nowrap">${eurM(cur.base)}</b></span></div>
+      <div class="two"><div class="field"><label for="evMh">Sur la paie de</label>${monthSel('evMh', mh, 'data-evo="moisHausse"')}</div><div class="field"><label for="evRd">Rattrapage depuis</label>${monthSel('evRd', P.rattrapDepuis || 1, 'data-evo="rattrapDepuis"')}</div></div>
+      <div class="evlist">${hRows || '<div class="mini">Aucune augmentation prévue.</div>'}</div>
+      <button class="btn dashed" data-evohadd="1">+ Ajouter une année</button>
+      <div class="hint">L'augmentation et le rattrapage arrivent dans le virement de la paie de ${MONTHS_L[mh - 1]} (cycle de ${MONTHS_L[mh % 12]}). Les années suivantes reprennent le dernier pourcentage. Corrige-le quand tu connais le vrai chiffre.</div></div>
+    <div class="hero" style="gap:10px"><div class="rowhead"><h2>Primes</h2></div>${pRows || '<div class="mini">Aucune prime.</div>'}
+      <button class="btn dashed" data-evpadd="1">+ Ajouter une prime</button>
+      <div class="hint">Chaque année reprend le montant de l'année d'avant tant que tu ne le changes pas. Une prime sans montant n'est pas comptée.</div></div>
+    <div class="hero" style="gap:6px"><div class="rowhead"><h2>Ce que Le 31 attend à la banque</h2></div>
+      <div class="list">${exp.length ? exp.map(e => `<div class="item" style="grid-template-columns:1fr auto"><span class="lbl"><b style="white-space:normal">${fmtJA(e.date)} · ${esc(e.lab)}</b><small>${esc(e.det)}</small></span><span class="amt ${e.v ? 'pos' : ''}">${e.v ? sgn(e.v) : '—'}</span></div>`).join('') : '<div class="empty">Rien de particulier sur les 12 prochains mois : paie habituelle de ' + eurM(cur.base) + '.</div>'}</div>
+      <div class="hint">Ces montants comptent dans l'atterrissage, les cycles suivants et la simulation. Quand la banque les voit, elle les reconnaît seule (montant attendu à ± 10 %).</div></div></section>`;
+}
+function saveEvo(acc, f) { const P = JSON.parse(JSON.stringify(salPlan(acc))); f(P); stage([regOp(acc, 'salaire', P)]); flush(); renderKeep(); }
+function renderKeep() { setTimeout(() => { const a = document.activeElement, id = a && a.id; render(); const e = id && $(id); if (e) { try { e.focus(); } catch (x) {} } }, 0); }
+
+/* ================= V3.1 : Épargne ================= */
+const lastDayPrev = () => addD(CUR + '-01', -1);
+const livName = L => esc(L.nom);
+function vEpaStart(acc) {
+  const X = excelFor(acc), ex = excelLikely(acc) && !!X.epargne, rows = (ex ? X.epargne : EPA_DEF[isPerso(acc) ? 'perso' : 'commun']).map(([n, t, pz, ob]) => ({ n, t, pz: ex ? pz : '', ob: ex ? ob : '' })).concat([{ n: '', t: 'livret', pz: '', ob: '' }]);
+  return `<section class="view">${backPlus}<h2 class="title">Démarrer l'épargne · ${esc(shortAcc(acc))}</h2>
+    <p class="hint" style="font-size:13px;margin:-8px 0 0">Point zéro : le solde de chaque livret à la date ci-dessous au soir. Ensuite, tout se calcule avec tes virements. Les mois vont du 1er au dernier jour.</p>
+    <form class="form" id="epaStart" data-acc="${esc(acc)}" novalidate>
+      <div class="field"><label for="ezD">Date du point zéro</label><input type="date" id="ezD" value="${lastDayPrev()}"></div>
+      <div class="list">${rows.map((r, i) => `<div class="env" style="gap:8px"><div class="two"><div class="field"><label for="ezN${i}">Livret</label><input id="ezN${i}" value="${esc(r.n)}" data-t="${r.t}"></div><div class="field"><label for="ezT${i}">Type</label><select id="ezT${i}"><option value="livret" ${r.t !== 'invest' ? 'selected' : ''}>Livret</option><option value="invest" ${r.t === 'invest' ? 'selected' : ''}>Investissement</option></select></div></div>
+        <div class="two"><div class="field"><label for="ezS${i}">${r.t === 'invest' ? 'Déjà versé' : 'Solde'} au point zéro (€)</label><input id="ezS${i}" inputmode="decimal" value="${esc(r.pz === '' ? '' : fr(r.pz))}" placeholder="0,00"></div><div class="field"><label for="ezO${i}">Objectif / mois (€)</label><input id="ezO${i}" inputmode="decimal" value="${esc(r.ob === '' ? '' : fr(r.ob))}" placeholder="—"></div></div></div>`).join('')}</div>
+      ${ex ? '<div class="note">Montants pré-remplis : vérifie-les avant de démarrer.</div>' : '<div class="note">Efface le nom d\'un livret que tu n\'as pas ; la ligne vide sert à en ajouter un.</div>'}
+      <div class="hint">Investissement : on suit ce que tu verses, pas la valeur du placement. Les charges fixes et prévues dont le nom contient celui d'un livret (ex. « Économie → Livret A ») y sont rattachées tout de suite.</div>
+      <button class="btn" type="submit">Démarrer</button></form></section>`;
+}
+function startEpaOps(acc) {
+  const d = $('ezD').value, ops = [], made = [];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { toast('Indique la date du point zéro'); return null; }
+  for (let i = 0; $('ezN' + i); i++) {
+    const n = $('ezN' + i).value.trim(); if (!n) continue;
+    const L = { id: uid(), compte: acc, nom: n, type: $('ezT' + i).value, pointZero: r2(num($('ezS' + i).value) || 0), dateZero: d, objectif: num($('ezO' + i).value) === null ? '' : r2(num($('ezO' + i).value)), ordre: i + 1, actif: 'oui' };
+    ops.push(upd('Livrets', L)); made.push(L);
+  }
+  if (!made.length) { toast('Indique au moins un livret'); return null; }
+  ops.push(...linkOps(acc, made));
+  return ops;
+}
+// rattache les fixes et prévues dont le nom (ou la catégorie) désigne un livret
+function linkOps(acc, Ls) {
+  const ops = [], hit = (txt, L) => NORM(txt).includes(NORM(L.nom));
+  const find = (lib, cat) => Ls.find(L => hit(lib, L)) || Ls.find(L => cat && NORM(cat) === NORM(L.nom)) || Ls.find(L => L.type === 'invest' && /INVEST|TRADE|BOURSE|PEA|CTO/.test(NORM(lib + ' ' + (cat || ''))));
+  DB.recurrents.filter(r => r.compte === acc && !r.livret && r.sens !== '+').forEach(r => { const L = find(r.libelle, r.categorie); if (L) ops.push(upd('Recurrents', { id: r.id, livret: L.id })); });
+  DB.prevues.filter(p => p.compte === acc && !p.livret && !p.etat && (num(p.montant) || 0) < 0).forEach(p => { const L = find(p.libelle, p.categorie); if (L) ops.push(upd('Prevues', { id: p.id, livret: L.id })); });
+  return ops;
+}
+function vEpa() {
+  const acc = UI.acc; if (!started3(acc)) return backPlus + vStart(acc);
+  const Ls = livretsOf(acc); if (!Ls.length) return vEpaStart(acc);
+  const first = addM(Ls.map(L => L.dateZero).sort()[0].slice(0, 7), 1), k = UI.epM && UI.epM >= first ? UI.epM : (CUR >= first ? CUR : first);
+  const last = addM(CUR, 12), data = Ls.map(L => ({ L, m: livMonths(L, last).find(x => x.k === k) }));
+  const sumNet = r2(data.reduce((a, x) => a + (x.m ? (x.m.st === 'fut' ? x.m.realNet + x.m.projNet : x.m.realNet) : 0), 0)), sumObj = r2(Ls.reduce((a, L) => a + (num(L.objectif) || 0), 0));
+  const cards = data.map(({ L, m }) => {
+    const solde = k === CUR ? livSolde(L, TODAY_ISO) : m ? m.fin : num(L.pointZero) || 0, o = num(L.objectif) || 0, st = livObj(L, m);
+    const done = m ? (m.st === 'fut' ? m.realNet + m.projNet : m.realNet) : 0, pc = o ? Math.max(0, Math.min(100, Math.round(100 * done / o))) : 0;
+    return `<button class="env2" data-livid="${esc(L.id)}"><span class="t"><b>${livName(L)}${L.type === 'invest' ? '<small class="mini" style="display:block;font-weight:400">total versé</small>' : ''}</b><span class="mono" style="font-size:16px;color:var(--ink)">${eurM(solde)}</span></span>
+      ${o ? `<span class="bar"><i class="${st === 'late' ? 'over' : ''}" style="width:${pc}%"></i></span>` : ''}
+      <span class="t"><span class="mono mini">${sgn(done)}${o ? ' / ' + eurM(o) : ''} ce mois</span>${st === 'ok' ? '<span class="ok mini">✓ atteint</span>' : st === 'wait' ? '<span class="mini">à venir</span>' : st === 'late' ? '<span class="warnt mini">▼ en retard</span>' : ''}</span></button>`;
+  }).join('');
+  return `<section class="view">${backPlus}<h2 class="title">Épargne</h2>
+    <div class="cycnav"><button class="nb" data-epm="-1" ${k > first ? '' : 'disabled'} aria-label="Mois précédent">‹</button><div class="cyct"><b>${esc(MONTHS_L[pm(k).m].replace(/^./, x => x.toUpperCase()))} ${pm(k).y}</b><span class="mono">${fmtJ(k + '-01')} → ${fmtJ(monthEnd(k))}</span></div><button class="nb" data-epm="1" ${k < addM(CUR, 11) ? '' : 'disabled'} aria-label="Mois suivant">›</button></div>
+    <div class="bigsolde" style="flex-direction:row;justify-content:space-between;align-items:flex-end"><span style="display:flex;flex-direction:column;gap:2px"><small>${k > CUR ? 'Prévu ce mois' : 'Épargné ce mois'}</small><b class="mono" style="font-size:32px">${sgn(sumNet)}</b></span>${sumObj ? `<span class="mono mini" style="text-align:right">objectif<br>${eurM(sumObj)}</span>` : ''}</div>
+    <div class="list">${cards}</div>
+    <button class="btn dashed" data-newliv="1">+ Ajouter un livret</button>
+    ${vEpaMpm(acc, Ls)}
+    <p class="hint">Un livret se remplit avec les virements classés « Épargne » dans À classer et avec les charges fixes liées à un livret. Une rentrée depuis un livret est un retrait.</p></section>`;
+}
+function vEpaMpm(acc, Ls) {
+  const sel = UI.epS !== 'tot' && Ls.find(L => L.id === UI.epS) ? [Ls.find(L => L.id === UI.epS)] : Ls, y = pm(CUR).y;
+  const ks = UI.epMpm === 'y' ? Array.from({ length: 12 }, (_, i) => y + '-' + pad(i + 1)) : Array.from({ length: 12 }, (_, i) => addM(CUR, i));
+  const last = ks[ks.length - 1] > addM(CUR, 12) ? ks[ks.length - 1] : addM(CUR, 12);
+  const rows = ks.map(k => { const ms = sel.map(L => livMonths(L, last).find(x => x.k === k)); if (ms.every(m => !m)) return { k, v: null };
+    return { k, v: r2(ms.reduce((a, m) => a + (m ? m.fin : 0), 0)), net: r2(ms.reduce((a, m) => a + (m ? m.net + m.int : 0), 0)), st: k < CUR ? 'real' : k === CUR ? 'cur' : 'fut' }; });
+  const pz = r2(sel.reduce((a, L) => a + (num(L.pointZero) || 0), 0));
+  return `<details class="jpj" id="epmpm" ${UI.epMpmOpen ? 'open' : ''}><summary>Mois par mois<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></summary>
+    <div class="mpmbody">${mpmSeg('epmpm', UI.epMpm)}
+    ${Ls.length > 1 ? `<div class="chips">${[['tot', 'Total']].concat(Ls.map(L => [L.id, L.nom])).map(([id, n]) => `<button class="chip" data-eps="${esc(id)}" aria-pressed="${(UI.epS === id) || (id === 'tot' && sel === Ls)}">${esc(n)}</button>`).join('')}</div>` : ''}
+    <div class="mini">${sel.length > 1 ? 'Épargne totale' : esc(sel[0].nom)} en fin de mois · point zéro <b class="mono">${eurM(pz)}</b> au ${fmtJ(sel[0].dateZero)}</div>
+    ${lineSvg(rows.map(x => ({ lab: iniM(x.k), v: x.v, st: x.st })), 'Épargne, mois par mois')}${legend}
+    <div class="mrows"><div class="mrow h"><span>MOIS</span><span>VERSÉ − RETIRÉ</span><span>SOLDE FIN</span></div>${rows.map(x => x.v === null ? `<div class="mrow off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini">avant le point zéro</span><span></span></div>`
+      : `<button class="mrow ${x.st}" data-epgo="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono ${x.net >= 0 ? 'pos' : 'warnt'}">${sgn(x.net)}</span><span class="mono">${eurM(x.v)}</span></button>`).join('')}</div>
+    <p class="hint">Les mois prévus viennent des charges fixes et des prévues liées aux livrets.</p></div></details>`;
+}
+function vEpl() {
+  const L = livOf(UI.epL); if (!L) { UI.tab = 'epa'; return vEpa(); }
+  const first = addM(L.dateZero.slice(0, 7), 1), ms = livMonths(L, addM(CUR, 12)), k = UI.epM && UI.epM >= first ? UI.epM : (CUR >= first ? CUR : first);
+  const m = ms.find(x => x.k === k), show = UI.eplAll ? ms : ms.filter(x => x.k >= (CUR >= first ? CUR : first)).slice(0, 5);
+  const inv = L.type === 'invest';
+  return `<section class="view"><button class="back" data-tab="epa">‹ Épargne</button>
+    <div class="rowhead"><h2 class="title">${livName(L)}</h2><span class="mini">${esc(shortAcc(L.compte))}</span></div>
+    <div class="tiles3"><div><small>${inv ? 'Total versé' : 'Solde actuel'}</small><b class="mono">${eurM(livSolde(L, TODAY_ISO))}</b></div><div><small>Point zéro ${fmtJ(L.dateZero)}</small><b class="mono">${eurM(num(L.pointZero) || 0)}</b></div><div><small>Objectif / mois</small><b class="mono acc">${num(L.objectif) ? eurM(num(L.objectif)) : '—'}</b></div></div>
+    <div class="list tbl"><div class="trow5 h"><span>MOIS</span><span>VERSÉ</span><span>RETIRÉ</span><span>${inv ? '' : 'INTÉR.'}</span><span>FIN (€)</span></div>
+      ${show.map(x => `<button class="trow5 ${x.st}" data-epgo="${esc(x.k)}"><span>${esc(MONTHS_C[pm(x.k).m])}${x.k.slice(0, 4) !== String(pm(CUR).y) ? ' ' + x.k.slice(2, 4) : ''}<small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono">${x.vers ? nbM(x.vers) : '—'}</span><span class="mono">${x.retr ? nbM(x.retr) : '—'}</span><span class="mono">${inv ? '' : x.int ? nbM(x.int) : '—'}</span><span class="mono b">${nbM(x.fin)}</span></button>`).join('')}
+      <button class="linkbtn" style="padding-left:14px" data-eplall="1">${UI.eplAll ? 'Moins' : 'Voir tous les mois'}</button></div>
+    <div class="hero" style="gap:6px"><div class="rowhead"><h2>Mouvements · ${esc(MONTHS_L[pm(k).m])} ${pm(k).y}</h2></div>
+      <div class="list">${m && (m.real.length || m.proj.length) ? m.real.concat(m.proj).sort((a, b) => a.date.localeCompare(b.date)).map(f => `<${f.mid ? `button data-mvlid="${esc(f.mid)}"` : f.oid ? `button data-oid="${esc(f.oid)}"` : 'div'} class="item ${f.prevu ? 'off' : ''}" style="grid-template-columns:52px 1fr auto"><span class="day">${fmtJ(f.date)}</span><span class="lbl"><b>${esc(f.label)}</b><small>${f.prevu ? 'prévu' : f.kind === 'int' ? 'intérêts' : f.mid ? 'à la main' : 'vu à la banque'}</small></span><span class="amt ${f.v > 0 ? 'pos' : ''}">${sgn(f.v)}</span></${f.mid || f.oid ? 'button' : 'div'}>`).join('') : '<div class="empty">Aucun mouvement ce mois-ci.</div>'}</div></div>
+    ${inv ? '' : `<form class="hero" id="recalForm" data-l="${esc(L.id)}" style="gap:8px" novalidate><div class="rowhead"><h2>Recaler le solde</h2></div>
+      <div class="hint">Tape le solde réel du livret (relevé, appli de la banque) : l'écart est enregistré en intérêts, aujourd'hui.</div>
+      <div class="rcrow"><input id="rcV" inputmode="decimal" placeholder="${esc(fr(livSolde(L, TODAY_ISO)))}" aria-label="Solde réel"><button class="btn dark" type="submit">Recaler</button></div></form>`}
+    <div class="two"><button class="btn ghost" data-livedit="${esc(L.id)}">Modifier</button><button class="btn ghost" data-mvlnew="${esc(L.id)}">Mouvement à la main</button></div></section>`;
+}
+function livSheet(acc, L) {
+  openSheet(`<form class="form" id="livForm" data-acc="${esc(acc)}" data-id="${esc(L ? L.id : '')}" novalidate><h2>${L ? livName(L) : 'Nouveau livret'}</h2>
+    <div class="two"><div class="field"><label for="lvN">Nom</label><input id="lvN" value="${esc(L ? L.nom : '')}" placeholder="Ex. PEL"></div><div class="field"><label for="lvT">Type</label><select id="lvT"><option value="livret">Livret</option><option value="invest" ${L && L.type === 'invest' ? 'selected' : ''}>Investissement</option></select></div></div>
+    <div class="two"><div class="field"><label for="lvZ">Point zéro (€)</label><input id="lvZ" inputmode="decimal" value="${L ? esc(fr(L.pointZero)) : ''}"></div><div class="field"><label for="lvD">Au</label><input type="date" id="lvD" value="${esc(L ? L.dateZero : lastDayPrev())}"></div></div>
+    <div class="field"><label for="lvO">Objectif / mois (€)</label><input id="lvO" inputmode="decimal" value="${L && L.objectif !== '' ? esc(fr(L.objectif)) : ''}" placeholder="—"></div>
+    <div class="actions">${L ? `<button type="button" class="btn danger" data-livdel="${esc(L.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div><div id="confirmBox"></div></form>`);
+}
+function mvlSheet(L, mv) {
+  const v = mv ? num(mv.montant) || 0 : 0, t = mv ? (mv.type === 'interets' ? 'int' : v < 0 ? 'retr' : 'vers') : 'vers';
+  openSheet(`<form class="form" id="mvlForm" data-l="${esc(L.id)}" data-id="${esc(mv ? mv.id : '')}" novalidate><h2>${livName(L)} · mouvement</h2>
+    <div class="seg seg3" id="mvlT"><button type="button" data-mvlt="vers" aria-pressed="${t === 'vers'}">Versement</button><button type="button" data-mvlt="retr" aria-pressed="${t === 'retr'}">Retrait</button><button type="button" data-mvlt="int" aria-pressed="${t === 'int'}">Intérêts</button></div>
+    <div class="two"><div class="field"><label for="mvA">Montant (€)</label><input id="mvA" inputmode="decimal" value="${mv ? esc(fr(Math.abs(v))) : ''}"></div><div class="field"><label for="mvD">Date</label><input type="date" id="mvD" value="${esc(mv ? mv.date : TODAY_ISO)}"></div></div>
+    <div class="field"><label for="mvL">Libellé</label><input id="mvL" value="${esc(mv ? mv.libelle : '')}" placeholder="Ex. virement depuis une autre banque"></div>
+    <div class="hint">Seulement pour ce qui ne passe pas par ton compte suivi (sinon, classe l'opération « Épargne » dans À classer).</div>
+    <div class="actions">${mv ? `<button type="button" class="btn danger" data-mvldel="${esc(mv.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div></form>`);
+}
+const livSelect = (acc, sel, id) => livretsOf(acc).length ? `<div class="field"><label for="${id}">Va vers le livret</label><select id="${id}"><option value="">—</option>${livretsOf(acc).map(L => `<option value="${esc(L.id)}" ${L.id === sel ? 'selected' : ''}>${livName(L)}</option>`).join('')}</select></div>` : '';
+
+/* ----- migration V3.0 → V3.1 (une fois, sur l'appareil du propriétaire) ----- */
+let MIG31 = false;
+function migrate31() {
+  if (MIG31 || !LOADED || !ME) return;
+  MIG31 = true;
+  const ops = [];
+  accs().filter(a => a.proprietaire === ME).forEach(a => {
+    const pv = DB.parametres.find(p => p.cle === 'v3|' + a.id);
+    if (pv && !DB.reglages.some(r => r.id === a.id + '|v3')) ops.push(upd('Reglages', { id: a.id + '|v3', compte: a.id, cle: 'v3', valeur: pv.valeur }), del('Parametres', 'v3|' + a.id));
+    if (started3(a.id) && !DB.reglages.some(r => r.id === a.id + '|salaire')) {
+      // la prévue « ½ 13ème mois » de la V3.0 devient la prime du même mois (son montant est repris)
+      const P = defaultPlan(a.id), parts = P.primes.filter(p => p.type === 'part');
+      DB.prevues.filter(p => p.compte === a.id && !p.etat && /13/.test(p.libelle)).forEach(p => {
+        const pr = parts.find(x => +x.mois === +p.date.slice(5, 7)), v = Math.abs(num(p.montant) || 0);
+        if (!pr) return;
+        if (v && !pr.montants[p.date.slice(0, 4)]) pr.montants[p.date.slice(0, 4)] = r2(v);
+        ops.push(del('Prevues', p.id));
+      });
+      ops.push(regOp(a.id, 'salaire', P));
+    }
+  });
+  if (ops.length) commit(ops);
+}
+
 /* ----- Réglages ----- */
 function vSet() {
   const sysDark = matchMedia('(prefers-color-scheme: dark)').matches, dark = UI.theme === 'dark' || (UI.theme === 'auto' && sysDark);
@@ -1273,7 +1619,7 @@ const readCat = id => { const v = $(id).value; return v === '__new' ? ($(id + 'N
 // Une opération (correction du classement, saisie à la main)
 function opSheet(o) {
   const acc = o.compte, v = num(o.montant) || 0, man = !o.ref && o.type !== 'ajust';
-  const kinds = [['ponct', 'Ponctuel'], ['fixe', 'Fixe']].concat(v > 0 ? [['sal', isPerso(acc) ? 'Salaire' : 'Début de cycle']] : []).concat([['', 'À classer']]);
+  const kinds = [['ponct', 'Ponctuel'], ['fixe', 'Fixe']].concat(v > 0 ? [['sal', isPerso(acc) ? 'Salaire' : 'Début de cycle']] : []).concat(livretsOf(acc).length ? [['epargne', 'Épargne']] : []).concat([['', 'À classer']]);
   const recs = DB.recurrents.filter(r => r.compte === acc && (r.sens === '+') === (v > 0));
   const k = o.type === 'ajust' ? 'ajust' : (o.type || '');
   openSheet(`<form class="form" id="opForm" data-id="${esc(o.id)}" novalidate>
@@ -1284,7 +1630,8 @@ function opSheet(o) {
     ${man ? `<div class="two"><div class="field"><label for="oD">Date</label><input type="date" id="oD" value="${esc(o.date)}"></div><div class="field"><label for="oA">Montant (€)</label><input id="oA" inputmode="decimal" value="${fr(Math.abs(v))}"></div></div>
       <div class="field"><label for="oL">Libellé</label><input id="oL" value="${esc(o.libelle)}"></div>` : `<div class="field"><label for="oN">Nom</label><input id="oN" value="${esc(nameOf(o))}"></div>`}
     <div class="field" data-for="fixe" ${k === 'fixe' ? '' : 'hidden'}><label for="oR">Charge fixe</label><select id="oR">${recs.map(r => `<option value="${esc(r.id)}" ${r.id === o.lien ? 'selected' : ''}>${esc(r.libelle)} · le ${esc(r.jour)}</option>`).join('')}<option value="" ${!recOf(o.lien) ? 'selected' : ''}>Nouvelle charge fixe (avec ce nom)</option></select></div>
-    <div class="field" data-for="cat" ${k === 'ponct' || k === 'fixe' ? '' : 'hidden'}><label for="oC">Catégorie</label>${catSelect(acc, o.categorie, 'oC')}</div>`}
+    <div class="field" data-for="cat" ${k === 'ponct' || k === 'fixe' ? '' : 'hidden'}><label for="oC">Catégorie</label>${catSelect(acc, o.categorie, 'oC')}</div>
+    ${livretsOf(acc).length ? `<div class="field" data-for="liv" ${k === 'epargne' ? '' : 'hidden'}><label for="oLiv">${v < 0 ? 'Versement vers' : 'Retrait depuis'}</label><select id="oLiv">${livretsOf(acc).map(L => `<option value="${esc(L.id)}" ${L.id === o.livret ? 'selected' : ''}>${livName(L)}</option>`).join('')}</select></div>` : ''}`}
     <div class="actions">${man ? `<button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button>` : o.type === 'ajust' ? `<button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
     <div id="confirmBox"></div></form>`);
 }
@@ -1297,6 +1644,7 @@ function addSheet(acc, p) {
     <div class="amountbox"><input id="aA" inputmode="decimal" placeholder="0" value="${p ? fr(Math.abs(v)) : ''}"><span>€</span></div>
     <div class="field"><label for="aL">Libellé</label><input id="aL" value="${esc(p ? p.libelle : '')}" placeholder="Ex. Cadeau"></div>
     <div class="two"><div class="field"><label for="aD">Date</label><input type="date" id="aD" value="${esc(p ? p.date : TODAY_ISO)}"></div><div class="field"><label for="aC">Catégorie</label>${catSelect(acc, p ? p.categorie : '', 'aC')}</div></div>
+    ${livSelect(acc, p ? p.livret : '', 'aLiv')}
     ${p ? `<label class="check"><input type="checkbox" id="aDone" ${p.etat ? 'checked' : ''}><span>Réalisée (ne compte plus dans l'atterrissage)</span></label>` : `<label class="check"><input type="checkbox" id="aPrev"><span><b>Prévue</b> (pas encore passée) : compte dans l'atterrissage jusqu'à ce que la banque la voie</span></label>`}
     <div class="actions">${p ? `<button type="button" class="btn danger" data-pdel="${esc(p.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
     ${isP ? '' : '<p class="hint">Avec la banque reliée, inutile de saisir ce qu\'elle va remonter : une saisie est reconnue quand la banque voit le même montant à ± 4 jours.</p>'}</form>`);
@@ -1309,6 +1657,7 @@ function recSheet(acc, r) {
     <div class="field"><label for="rL">Nom</label><input id="rL" value="${esc(r ? r.libelle : '')}" placeholder="Ex. Orange"></div>
     <div class="two"><div class="field"><label for="rA">Montant (€)</label><input id="rA" inputmode="decimal" value="${r ? fr(r.montant) : ''}"></div><div class="field"><label for="rJ">Jour du mois</label><input id="rJ" inputmode="numeric" value="${esc(r ? r.jour : '')}"></div></div>
     <div class="field"><label for="rC">Catégorie</label>${catSelect(acc, r ? r.categorie : '', 'rC')}</div>
+    ${livSelect(acc, r ? r.livret : '', 'rLiv')}
     <div class="two"><div class="field"><label for="rD">Début</label><input type="date" id="rD" value="${esc(r ? r.debut : (curCycle(acc) || {}).debut || TODAY_ISO)}"></div><div class="field"><label for="rF">Fin (facultatif)</label><input type="date" id="rF" value="${esc(r ? r.fin : '')}"></div></div>
     ${r ? `<label class="switch" for="rOn"><span>Active</span><input type="checkbox" id="rOn" ${bool(r.actif) ? 'checked' : ''}></label>` : ''}
     ${r && r.motif ? `<div class="hint">Reconnue à la banque sous « ${esc(r.motif.replace(/^\+/, ''))} ».</div>` : ''}
@@ -1328,7 +1677,8 @@ function cycSheet(acc, c) {
     <h2>Cycle ${deMois(c.mois)} ${pm(c.mois).y}</h2>
     ${c.sal ? `<div class="note good">${P ? 'Salaire' : esc(salLabel(acc))} vu à la banque le <b>${fmtJA(c.sal.date)}</b> (${eurM(num(c.sal.montant))}).</div>` : ''}
     <div class="two"><div class="field"><label for="cyD">${P ? 'Date du salaire' : 'Date du virement'}</label><input type="date" id="cyD" value="${esc(c.debut)}" ${c.i === 0 ? 'disabled' : ''}></div>
-    <div class="field"><label for="cyM">${P ? 'Salaire net (€)' : 'Montant (€)'}</label><input id="cyM" inputmode="decimal" value="${fr(c.montant)}"></div></div>
+    <div class="field"><label for="cyM">${P ? 'Salaire de base (€)' : 'Montant (€)'}</label><input id="cyM" inputmode="decimal" value="${fr(c.base)}"></div></div>
+    ${c.detail.rappel || c.detail.primes.length ? `<div class="note">Paie attendue : ${eurM(c.base)}${c.detail.rappel ? ' + rattrapage ' + eurM(c.detail.rappel) : ''}${c.detail.primes.map(p => ' + ' + esc(p.nom.toLowerCase()) + ' ' + eurM(p.v)).join('')} = <b>${eurM(c.montant)}</b></div>` : ''}
     <div class="field"><label for="cyS">Solde de départ (vide = automatique)</label><input id="cyS" inputmode="decimal" value="${c.man.includes('s') || c.man.includes('b') ? fr(c.row.soldeDepart) : ''}" placeholder="automatique : ${esc(eurM(R.depart))}"></div>
     <div class="hint">Solde juste avant ${P ? 'le salaire' : 'le virement'}. Automatique : ${c.i === 0 ? 'solde lu à la banque au démarrage' : 'fin réelle du cycle précédent quand il est fini, sinon son atterrissage avec budget'}. Actuellement : <b>${esc(k)}</b>.${c.i === 0 ? ' La date de début du suivi ne se change pas ici (Réglages > Recommencer le suivi).' : ''}</div>
     <div class="actions">${c.man ? `<button type="button" class="btn ghost" data-cyauto="${esc(c.mois)}">Tout en automatique</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div></form>`);
@@ -1360,7 +1710,7 @@ document.addEventListener('click', ev => {
   if (ds.tcat) { UI.td.cat = UI.td.cat === ds.tcat && ds.tcat !== '__new' ? '' : ds.tcat; document.querySelectorAll('[data-tcat]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tcat === UI.td.cat)); const n = $('tdCatNew'); if (n) { n.hidden = UI.td.cat !== '__new'; if (!n.hidden) n.focus(); } return; }
   if (ds.seuil) { const o = DB.mouvements.find(x => x.id === ds.seuil); if (o) seuilSheet(o); return; }
   if (ds.oid) { const o = DB.mouvements.find(x => x.id === ds.oid); if (o) opSheet(o); return; }
-  if (ds.okind !== undefined) { document.querySelectorAll('[data-okind]').forEach(b => b.setAttribute('aria-pressed', b === t)); const f = document.querySelector('[data-for="fixe"]'), c = document.querySelector('[data-for="cat"]'); if (f) f.hidden = ds.okind !== 'fixe'; if (c) c.hidden = !(ds.okind === 'ponct' || ds.okind === 'fixe'); return; }
+  if (ds.okind !== undefined) { document.querySelectorAll('[data-okind]').forEach(b => b.setAttribute('aria-pressed', b === t)); const f = document.querySelector('[data-for="fixe"]'), c = document.querySelector('[data-for="cat"]'); if (f) f.hidden = ds.okind !== 'fixe'; if (c) c.hidden = !(ds.okind === 'ponct' || ds.okind === 'fixe'); const lv = document.querySelector('[data-for="liv"]'); if (lv) lv.hidden = ds.okind !== 'epargne'; return; }
   if (ds.txtab) { UI.txTab = ds.txtab; render(); return; }
   if (ds.txseg) { UI.txSeg = ds.txseg; render(); return; }
   if (ds.newop) { addSheet(acc, null); return; }
@@ -1476,6 +1826,7 @@ document.addEventListener('submit', ev => {
       const cat = readCat('oC'), nom = $('oN') ? $('oN').value.trim() : '';
       const h = { type, categorie: cat, nom: nom && nom !== smartName(o.libelle || '') ? nom : '' };
       if (type === 'fixe') { h.recId = $('oR').value; if (!h.recId) h.newRec = { libelle: nom || nameOf(o), jour: +o.date.slice(8, 10), montant: Math.abs(num(o.montant) || 0) }; }
+      if (type === 'epargne') { h.livret = $('oLiv') ? $('oLiv').value : ''; h.categorie = 'Épargne'; }
       ops.push(...classifyOps(o, h));
     }
     commit(ops); closeSheet(); toast('Opération mise à jour'); return;
@@ -1485,16 +1836,17 @@ document.addEventListener('submit', ev => {
     const neg = (f.querySelector('[data-asens][aria-pressed=true]') || {}).dataset.asens !== '+';
     if (!(a > 0)) { toast('Indique un montant'); return; } if (!/^\d{4}-\d{2}-\d{2}$/.test(dt)) { toast('Indique une date'); return; }
     const v = r2(neg ? -a : a), ops = cat ? newCatOps(acc, cat) : [];
-    if (f.dataset.pid) ops.push(upd('Prevues', { id: f.dataset.pid, date: dt, libelle: lb || cat || 'Prévue', montant: v, categorie: cat, etat: $('aDone').checked ? 'realisee' : '' }));
-    else if ($('aPrev').checked) ops.push(upd('Prevues', { id: uid(), compte: acc, date: dt, libelle: lb || cat || 'Prévue', montant: v, categorie: cat, etat: '', lien: '' }));
-    else ops.push(upd('Mouvements', { id: uid(), compte: acc, date: dt, montant: v, libelle: lb || cat || 'Opération', nom: '', categorie: cat, type: 'ponct', lien: '', auto: '', ref: '', profil: ME || '' }));
+    const liv = $('aLiv') ? $('aLiv').value : '';
+    if (f.dataset.pid) ops.push(upd('Prevues', { id: f.dataset.pid, date: dt, libelle: lb || cat || 'Prévue', montant: v, categorie: cat, etat: $('aDone').checked ? 'realisee' : '', livret: liv }));
+    else if ($('aPrev').checked) ops.push(upd('Prevues', { id: uid(), compte: acc, date: dt, libelle: lb || cat || 'Prévue', montant: v, categorie: cat, etat: '', lien: '', livret: liv }));
+    else ops.push(upd('Mouvements', { id: uid(), compte: acc, date: dt, montant: v, libelle: lb || cat || 'Opération', nom: '', categorie: cat || (liv ? 'Épargne' : ''), type: liv ? 'epargne' : 'ponct', lien: '', auto: '', ref: '', profil: ME || '', livret: liv }));
     commit(ops); closeSheet(); toast('Enregistré'); return;
   }
   if (f.id === 'recForm') {
     const acc = f.dataset.acc, a = num($('rA').value), j = num($('rJ').value), l = $('rL').value.trim(), cat = readCat('rC');
     if (!l || !(a > 0) || !(j >= 1 && j <= 31)) { toast('Indique le nom, le montant et le jour (1 à 31)'); return; }
     const sens = (f.querySelector('[data-rsens][aria-pressed=true]') || {}).dataset.rsens || '-';
-    const row = { id: f.dataset.id || uid(), compte: acc, libelle: l, montant: r2(a), sens, jour: j, categorie: cat, debut: $('rD').value, fin: $('rF').value, actif: $('rOn') ? ($('rOn').checked ? 'oui' : 'non') : 'oui' };
+    const row = { id: f.dataset.id || uid(), compte: acc, libelle: l, montant: r2(a), sens, jour: j, categorie: cat, debut: $('rD').value, fin: $('rF').value, actif: $('rOn') ? ($('rOn').checked ? 'oui' : 'non') : 'oui', livret: $('rLiv') ? $('rLiv').value : '' };
     if (!f.dataset.id) row.motif = '';
     commit([...(cat ? newCatOps(acc, cat) : []), upd('Recurrents', row)]); closeSheet(); toast('Charge fixe enregistrée'); return;
   }
@@ -1513,7 +1865,7 @@ document.addEventListener('submit', ev => {
     const acc = f.dataset.acc, k = f.dataset.mois, c = cycleByMois(acc, k), d = $('cyD').value, m = num($('cyM').value), sRaw = $('cyS').value.trim(), s = num(sRaw);
     const man = new Set(String(c.row.manuel || '').split('').filter(x => x !== 'b' || !sRaw)), row = { id: acc + '|' + k, compte: acc, mois: k };
     if (c.i > 0 && /^\d{4}-\d{2}-\d{2}$/.test(d) && d !== c.debut) { row.debut = d; man.add('d'); }
-    if (m !== null && r2(m) !== r2(c.montant)) { row.montant = r2(m); man.add('m'); }
+    if (m !== null && r2(m) !== r2(c.base)) { row.montant = r2(m); man.add('m'); }
     if (sRaw && s !== null) { row.soldeDepart = r2(s); if (!(c.man.includes('b') && r2(s) === r2(num(c.row.soldeDepart)))) { man.delete('b'); man.add('s'); } }
     else if (!sRaw && !c.man.includes('b')) { row.soldeDepart = ''; man.delete('s'); }
     row.manuel = [...man].join('');
@@ -1531,6 +1883,76 @@ document.addEventListener('submit', ev => {
     const id = 'p' + uid();
     commit([upd('Profils', { id, nom: n, perso: $('pfperso').checked ? 'oui' : 'non', ordre: Math.max(0, ...DB.profils.map(p => num(p.ordre) || 0)) + 1 })]);
     setTimeout(() => invite(id), 400); return;
+  }
+});
+
+/* ================= V3.1 : événements (évolution du salaire, épargne, mois par mois) ================= */
+document.addEventListener('toggle', ev => {
+  const id = ev.target && ev.target.id;
+  if (id === 'mpm') { UI.mpmOpen = ev.target.open; store.set('le31-mpmo', UI.mpmOpen); }
+  if (id === 'epmpm') { UI.epMpmOpen = ev.target.open; store.set('le31-epmo', UI.epMpmOpen); }
+}, true);
+document.addEventListener('click', ev => {
+  const t = ev.target.closest('button'); if (!t) return;
+  const ds = t.dataset, acc = UI.acc;
+  if (ds.gocyc) { UI.cyc[acc] = ds.gocyc; render(); scrollTo(0, 0); return; }
+  if (ds.mpm) { UI.mpm = ds.mpm; store.set('le31-mpm', UI.mpm); render(); return; }
+  if (ds.epmpm) { UI.epMpm = ds.epmpm; store.set('le31-epmpm', UI.epMpm); render(); return; }
+  if (ds.eps) { UI.epS = ds.eps; render(); return; }
+  if (ds.epm) { UI.epM = addM(UI.epM || CUR, +ds.epm); render(); return; }
+  if (ds.epgo) { UI.epM = ds.epgo; render(); if (UI.tab === 'epa') scrollTo(0, 0); return; }
+  if (ds.livid) { UI.epL = ds.livid; UI.tab = 'epl'; UI.eplAll = false; render(); scrollTo(0, 0); return; }
+  if (ds.eplall) { UI.eplAll = !UI.eplAll; render(); return; }
+  if (ds.newliv) { livSheet(acc, null); return; }
+  if (ds.livedit) { const L = livOf(ds.livedit); if (L) livSheet(L.compte, L); return; }
+  if (ds.livdel) { $('confirmBox').innerHTML = `<div class="alert bad" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Supprimer ce livret ? Les opérations restent, sans lien.<button type="button" class="btn danger small" data-livdelok="${esc(ds.livdel)}">Supprimer</button></div>`; return; }
+  if (ds.livdelok) {
+    const id = ds.livdelok, ops = [del('Livrets', id)];
+    DB.recurrents.filter(r => r.livret === id).forEach(r => ops.push(upd('Recurrents', { id: r.id, livret: '' })));
+    DB.prevues.filter(p => p.livret === id).forEach(p => ops.push(upd('Prevues', { id: p.id, livret: '' })));
+    DB.mvtsLivret.filter(m => m.livret === id).forEach(m => ops.push(del('MvtsLivret', m.id)));
+    DB.mouvements.filter(o => o.livret === id).forEach(o => ops.push(upd('Mouvements', o.type === 'epargne' ? { id: o.id, livret: '', type: '', auto: '' } : { id: o.id, livret: '' })));
+    UI.tab = 'epa'; commit(ops); closeSheet(); toast('Livret supprimé'); return;
+  }
+  if (ds.mvlnew) { const L = livOf(ds.mvlnew); if (L) mvlSheet(L, null); return; }
+  if (ds.mvlid) { const m = DB.mvtsLivret.find(x => x.id === ds.mvlid); if (m && livOf(m.livret)) mvlSheet(livOf(m.livret), m); return; }
+  if (ds.mvldel) { commit([del('MvtsLivret', ds.mvldel)]); closeSheet(); toast('Mouvement supprimé'); return; }
+  if (ds.mvlt) { document.querySelectorAll('[data-mvlt]').forEach(b => b.setAttribute('aria-pressed', b === t)); return; }
+  if (ds.tliv) { UI.td.liv = ds.tliv; document.querySelectorAll('[data-tliv]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tliv === ds.tliv)); return; }
+  if (ds.caltab) { UI.calTab = ds.caltab; render(); return; }
+  if (ds.evohadd) { saveEvo(acc, P => { P.hausses = P.hausses || {}; const ys = Object.keys(P.hausses).map(Number); const y = ys.length ? Math.max(...ys) + 1 : pm(CUR).y + 1; P.hausses[y] = ys.length ? P.hausses[Math.max(...ys)] : 2; }); return; }
+  if (ds.evohdel) { saveEvo(acc, P => { delete P.hausses[ds.evohdel]; }); return; }
+  if (ds.evpadd) { saveEvo(acc, P => { (P.primes = P.primes || []).push({ id: uid(), nom: 'Prime', type: 'part', mois: 12, jour: 15, montants: {} }); }); return; }
+  if (ds.evpdel) { saveEvo(acc, P => { P.primes = (P.primes || []).filter(p => p.id !== ds.evpdel); }); return; }
+});
+document.addEventListener('change', ev => {
+  const el = ev.target, ds = el.dataset || {}, acc = UI.acc;
+  if (ds.evo) { saveEvo(acc, P => { P[ds.evo] = +el.value; }); return; }
+  if (ds.evoh) { const v = num(el.value); saveEvo(acc, P => { P.hausses = P.hausses || {}; if (v === null) delete P.hausses[ds.evoh]; else P.hausses[ds.evoh] = v; }); return; }
+  if (ds.evp) { saveEvo(acc, P => { const p = (P.primes || []).find(x => x.id === ds.evp); if (!p) return; p[ds.f] = ds.f === 'mois' || ds.f === 'jour' ? +el.value || '' : el.value.trim(); }); return; }
+  if (ds.evpm) { const v = num(el.value); saveEvo(acc, P => { const p = (P.primes || []).find(x => x.id === ds.evpm); if (!p) return; p.montants = p.montants || {}; if (v === null) delete p.montants[ds.y]; else p.montants[ds.y] = v; }); return; }
+});
+document.addEventListener('submit', ev => {
+  const f = ev.target; ev.preventDefault();
+  if (f.id === 'epaStart') { const ops = startEpaOps(f.dataset.acc); if (ops) { commit(ops); toast('Épargne démarrée'); } return; }
+  if (f.id === 'livForm') {
+    const acc = f.dataset.acc, n = $('lvN').value.trim(), d = $('lvD').value; if (!n || !/^\d{4}-\d{2}-\d{2}$/.test(d)) { toast('Indique le nom et la date du point zéro'); return; }
+    const L = { id: f.dataset.id || uid(), compte: acc, nom: n, type: $('lvT').value, pointZero: r2(num($('lvZ').value) || 0), dateZero: d, objectif: num($('lvO').value) === null ? '' : r2(num($('lvO').value)), actif: 'oui' };
+    if (!f.dataset.id) L.ordre = Math.max(0, ...livretsOf(acc).map(x => num(x.ordre) || 0)) + 1;
+    const ops = [upd('Livrets', L)]; if (!f.dataset.id) ops.push(...linkOps(acc, [L]));
+    commit(ops); closeSheet(); toast('Livret enregistré'); return;
+  }
+  if (f.id === 'mvlForm') {
+    const L = livOf(f.dataset.l), a = num($('mvA').value), d = $('mvD').value, t = (f.querySelector('[data-mvlt][aria-pressed=true]') || {}).dataset.mvlt || 'vers';
+    if (!L || !(a > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(d)) { toast('Indique le montant et la date'); return; }
+    commit([upd('MvtsLivret', { id: f.dataset.id || uid(), compte: L.compte, livret: L.id, date: d, montant: r2(t === 'retr' ? -a : a), type: t === 'int' ? 'interets' : t === 'retr' ? 'retrait' : 'versement', libelle: $('mvL').value.trim() || (t === 'int' ? 'Intérêts' : t === 'retr' ? 'Retrait' : 'Versement') })]);
+    closeSheet(); toast('Mouvement enregistré'); return;
+  }
+  if (f.id === 'recalForm') {
+    const L = livOf(f.dataset.l), v = num($('rcV').value); if (!L || v === null) { toast('Indique le solde réel'); return; }
+    const delta = r2(v - livSolde(L, TODAY_ISO)); if (Math.abs(delta) < 0.005) { toast('Déjà juste'); return; }
+    commit([upd('MvtsLivret', { id: uid(), compte: L.compte, livret: L.id, date: TODAY_ISO, montant: delta, type: 'interets', libelle: 'Intérêts (recalage)' })]);
+    toast('Recalé : ' + sgn(delta) + ' en intérêts'); return;
   }
 });
 function copyText(txt, el) {

@@ -1,5 +1,6 @@
 /**
  * LE 31 — serveur (Google Apps Script lié au Google Sheet « Le 31 »)
+ * Version 3.1 : épargne (Livrets, MvtsLivret), réglages privés par compte (Reglages), colonne livret.
  * Version 3.0 : nouveaux onglets (Mouvements, Recurrents, Cycles, Prevues, Budgets, Apprentissage) : l'appli V3
  *   fonctionne par cycles de paie. Les onglets des versions 1 et 2 restent dans le Sheet, intacts, mais ne sont plus envoyés.
  * Version 2.0 : connexion bancaire directe (Enable Banking) ; V1.4 : règles d'import par compte.
@@ -9,7 +10,7 @@
  * Voir le tuto d'installation (iPad ou PC).
  */
 
-const VERSION_SERVEUR = '3.0';
+const VERSION_SERVEUR = '3.1';
 const VALIDITE_LIEN_JOURS = 14;
 
 // Onglets du Google Sheet et leurs colonnes (créés automatiquement)
@@ -30,17 +31,21 @@ const ONGLETS = {
   Invitations: ['code', 'profil', 'cree', 'utilise', 'par'],
   Banque:      ['id', 'compte', 'aspsp', 'fin', 'nom', 'sid', 'jusqua', 'profil', 'derniere', 'solde', 'actif'],
   // V3 : cycles de paie
-  Mouvements:  ['id', 'compte', 'date', 'montant', 'libelle', 'nom', 'categorie', 'type', 'lien', 'auto', 'ref', 'profil'],
-  Recurrents:  ['id', 'compte', 'libelle', 'montant', 'sens', 'jour', 'categorie', 'debut', 'fin', 'actif', 'motif'],
+  Mouvements:  ['id', 'compte', 'date', 'montant', 'libelle', 'nom', 'categorie', 'type', 'lien', 'auto', 'ref', 'profil', 'livret'],
+  Recurrents:  ['id', 'compte', 'libelle', 'montant', 'sens', 'jour', 'categorie', 'debut', 'fin', 'actif', 'motif', 'livret'],
   Cycles:      ['id', 'compte', 'mois', 'debut', 'montant', 'soldeDepart', 'manuel'],
-  Prevues:     ['id', 'compte', 'date', 'libelle', 'montant', 'categorie', 'etat', 'lien'],
+  Prevues:     ['id', 'compte', 'date', 'libelle', 'montant', 'categorie', 'etat', 'lien', 'livret'],
   Budgets:     ['id', 'compte', 'nom', 'budget', 'ordre'],
-  Apprentissage: ['id', 'compte', 'cle', 'type', 'categorie', 'nom', 'montant']
+  Apprentissage: ['id', 'compte', 'cle', 'type', 'categorie', 'nom', 'montant'],
+  // V3.1 : épargne et réglages privés d'un compte (salaire, augmentations, primes)
+  Livrets:     ['id', 'compte', 'nom', 'type', 'pointZero', 'dateZero', 'objectif', 'ordre', 'actif'],
+  MvtsLivret:  ['id', 'compte', 'livret', 'date', 'montant', 'type', 'libelle'],
+  Reglages:    ['id', 'compte', 'cle', 'valeur']
 };
 const PRIVES = ['Acces', 'Invitations'];          // jamais renvoyés ni modifiables par l'appli
 const LECTURE = ['Banque'];                       // renvoyé (filtré par compte) mais modifié seulement par le serveur
 const PAR_COMPTE = ['Categories', 'Fixes', 'Operations', 'Pointages', 'Clotures', 'Simulations', 'Previsions',
-  'Mouvements', 'Recurrents', 'Cycles', 'Prevues', 'Budgets', 'Apprentissage'];
+  'Mouvements', 'Recurrents', 'Cycles', 'Prevues', 'Budgets', 'Apprentissage', 'Livrets', 'MvtsLivret', 'Reglages'];
 // Onglets des versions 1 et 2 : gardés dans le Sheet (retour arrière possible), plus envoyés ni modifiés par l'appli V3
 const ANCIENS = ['Categories', 'Fixes', 'Virements', 'Operations', 'Pointages', 'Clotures', 'Simulations', 'Previsions', 'Regles'];
 
