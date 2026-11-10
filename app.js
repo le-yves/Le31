@@ -1,9 +1,9 @@
-/* LE 31 — appli téléphone — V3.3 (V3.2 + bilan du cycle perso et commun, barre du cycle ; aucune donnée personnelle dans le code)
+/* LE 31 — appli téléphone — V3.1.1 (V3.0 + évolution du salaire, épargne, mois par mois ; aucune donnée personnelle dans le code)
    Pilotage par cycles de paie : Perso du salaire à la veille du suivant, Commun de l'arrivée du virement de début de cycle
    à la veille du suivant. Opérations lues à la banque (Enable Banking), classées à la main le premier cycle (« À classer »),
    puis automatiquement quand c'est sûr. Données : Google Sheet via Google Apps Script (Code.gs 3.1). */
 'use strict';
-const APP_VERSION = '3.3';
+const APP_VERSION = '3.1.1';
 
 /* ================= Outils ================= */
 const MONTHS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
@@ -989,13 +989,13 @@ const UI = { acc: store.get('le31-compte', ''), tab: 'home', txTab: 'ponct', txS
   td: {}, simTab: 'achat', theme: store.get('le31-theme', 'auto'), startAcc: {},
   calTab: 'cyc', mpm: store.get('le31-mpm', 'g'), mpmOpen: store.get('le31-mpmo', false), epM: '', epL: '', epS: 'tot', epMpmOpen: store.get('le31-epmo', false), epMpm: store.get('le31-epmpm', 'g'), eplAll: false };
 const main = $('main');
-const VIEWS = { home: () => vHome(), todo: () => vTodo(), tx: () => vTx(), bud: () => vBud(), plus: () => vPlus(), cal: () => vCal(), sim: () => vSim(), set: () => vSet(), epa: () => vEpa(), epl: () => vEpl(), bil: () => vBil() };
+const VIEWS = { home: () => vHome(), todo: () => vTodo(), tx: () => vTx(), bud: () => vBud(), plus: () => vPlus(), cal: () => vCal(), sim: () => vSim(), set: () => vSet(), epa: () => vEpa(), epl: () => vEpl() };
 const todoCount = acc => DB.mouvements.filter(o => o.compte === acc && !o.type).length;
 function render() {
   refreshNow();
   if (!DB.comptes.find(a => a.id === UI.acc) && DB.comptes.length) UI.acc = accs()[0].id;
   $('foot').textContent = 'Le 31 · V' + APP_VERSION;
-  const tabOf = { cal: 'plus', sim: 'plus', set: 'plus', epa: 'plus', epl: 'plus', bil: 'home' }[UI.tab] || UI.tab;
+  const tabOf = { cal: 'plus', sim: 'plus', set: 'plus', epa: 'plus', epl: 'plus' }[UI.tab] || UI.tab;
   document.querySelectorAll('nav.tabs button').forEach(b => b.setAttribute('aria-current', b.dataset.tab === tabOf));
   const blocked = BK.view === 'retour' ? null : gate();
   const bkv = !blocked && (BK.view || (bkPend() ? 'map' : null));
@@ -1005,7 +1005,7 @@ function render() {
   const nb = accs().reduce((a, x) => a + todoCount(x.id), 0), bd = $('todoBadge'); if (bd) { bd.textContent = nb; bd.hidden = !nb; }
   try { main.innerHTML = blocked || (bkv ? vBank() : (VIEWS[UI.tab] || VIEWS.home)()); }
   catch (e) { console.error(e); main.innerHTML = `<section class="view"><div class="note bad">Un problème d'affichage est survenu : ${esc(e.message)}. Recharge l'appli.</div></section>`; }
-  setSync(); bankChip(); if (LOADED && ME) snapLater();
+  setSync(); bankChip();
 }
 // Écrans bloquants : appli pas encore reliée, lien refusé, accès coupé, premier chargement, premier lancement
 function gate() {
@@ -1043,21 +1043,13 @@ function gate() {
 /* ----- Outils d'affichage ----- */
 const money = v => `<span class="mono">${sgn(v)}</span>`;
 const nbM = v => (v < -0.004 ? '−' : '') + eur(Math.abs(v)).replace(/\s?€/, '');
-const sgnN = v => (v < -0.004 ? '− ' : '+ ') + eur(Math.abs(v)).replace(/\s?€/, '');
-const sgnM = v => sgnN(v) + ' €';
-// V3.2 : couleurs (réglables par compte : seuil du vert en €, marge du rythme des budgets en points)
-const colSet = acc => Object.assign({ seuil: 100, marge: 10 }, regJ(acc, 'couleurs') || {});
-const tone = (acc, v) => v < -0.004 ? 'bad' : v < colSet(acc).seuil - 0.004 ? 'warn' : 'good';
-const evTone = v => v < -0.004 ? 'bad' : 'good';
-const cycEl = c => { const n = dDiff(c.debut, c.fin) + 1, k = Math.max(0, Math.min(n, dDiff(c.debut, TODAY_ISO) + 1)); return { n, k, pct: Math.round(100 * k / n) }; };
-const budTone = (acc, spent, bud, elPct) => spent > bud + 0.004 ? 'bad' : bud > 0 && 100 * spent / bud > elPct + colSet(acc).marge ? 'warn' : 'good';
 const eurM = v => (v < -0.004 ? '− ' : '') + eur(Math.abs(v)).replace(/\s?€/, '') + ' €';
 const selCycle = acc => (UI.cyc[acc] && cycleByMois(acc, UI.cyc[acc])) || curCycle(acc);
-function cycNav(acc, c, sub) {
+function cycNav(acc, c) {
   const cy = cyclesOf(acc), cur = curCycle(acc);
   const prev = c.i > 0, next = c.i < Math.min(cy.length - 1, cur.i + 11);
   return `<div class="cycnav"><button class="nb" data-cyc="-1" ${prev ? '' : 'disabled'} aria-label="Cycle précédent">‹</button>
-    <div class="cyct"><b>Cycle ${deMois(c.mois)}${pm(c.mois).y !== pm(labelMonth(TODAY_ISO)).y ? ' ' + pm(c.mois).y : ''}</b>${sub ? `<span class="cyl">${sub}</span>` : `<span class="mono">${fmtJ(c.debut)} → ${fmtJ(c.fin)}${c.debut <= TODAY_ISO && TODAY_ISO <= c.fin ? ` · J${dDiff(c.debut, TODAY_ISO) + 1}/${dDiff(c.debut, c.fin) + 1}` : ''}</span>`}</div>
+    <div class="cyct"><b>Cycle ${deMois(c.mois)}${pm(c.mois).y !== pm(labelMonth(TODAY_ISO)).y ? ' ' + pm(c.mois).y : ''}</b><span class="mono">${fmtJ(c.debut)} → ${fmtJ(c.fin)}${c.debut <= TODAY_ISO && TODAY_ISO <= c.fin ? ` · J${dDiff(c.debut, TODAY_ISO) + 1}/${dDiff(c.debut, c.fin) + 1}` : ''}</span></div>
     <button class="nb" data-cyc="1" ${next ? '' : 'disabled'} aria-label="Cycle suivant">›</button></div>`;
 }
 const progBar = c => { const n = dDiff(c.debut, c.fin) + 1, k = Math.max(0, Math.min(n, dDiff(c.debut, TODAY_ISO) + 1)); return `<div class="prog"><i style="width:${Math.round(100 * k / n)}%"></i></div>`; };
@@ -1121,48 +1113,35 @@ function vHome() {
   const c = selCycle(acc), R = cycleCalc(acc, c), nTodo = todoCount(acc);
   const bigLbl = R.isCur ? 'Solde actuel' : R.isPast ? 'Solde de fin (réel)' : 'Solde de départ (projeté)';
   const bigV = R.isCur ? R.soldeActuel : R.isPast ? R.realEnd : R.depart;
-  return `<section class="view">${bankBanners(acc)}${bilBanner(acc, c, R)}
-    <div class="block">${cycNav(acc, c, cycLeft(acc, c))}${cycBar(acc, c)}</div>
+  const neg = R.atterAvec < 0;
+  return `<section class="view">${bankBanners(acc)}
+    <div class="block">${cycNav(acc, c)}${R.isCur ? progBar(c) : ''}</div>
     <div class="bigsolde"><small>${bigLbl}</small><b class="mono">${eurM(bigV)}</b>${num(c.row.soldeDepart) === null || c.row.soldeDepart === '' ? (c.i === 0 ? '<span class="mini warn">Solde de départ à renseigner (Calendrier salaires)</span>' : '') : ''}</div>
     <div class="kpis">
-      <div class="kv1"><span>Atterrissage sans budget</span><b class="mono t-${tone(acc, R.atterSans)}">${sgnM(R.atterSans)}</b></div>
-      ${kpiBud(acc, c, R)}
-      <div class="kv1 main ${tone(acc, R.atterAvec)}"><span>Atterrissage avec budget</span><b class="mono">${sgnM(R.atterAvec)}</b></div>
+      <div class="kv1"><span>Atterrissage sans budget</span><b class="mono">${eurM(R.atterSans)}</b></div>
+      <div class="kv1"><span>Budget restant</span><b class="mono">${R.reserve ? '− ' + eurM(R.reserve) : eurM(0)}</b></div>
+      <div class="kv1 main ${neg ? 'neg' : ''}"><span>Atterrissage avec budget</span><b class="mono">${neg ? '▼ ' : ''}${eurM(R.atterAvec)}</b></div>
     </div>
-    ${bilBtn(acc, c, R)}
     ${nTodo ? `<button class="todoline" data-tab="todo"><span><b>${nTodo}</b> opération${nTodo > 1 ? 's' : ''} à classer</span><span>›</span></button>` : ''}
     ${vJpj(acc, c, R)}
     ${vMpm(acc)}
   </section>`;
 }
-// Budget restant : « reste / prévu », barre et repère du jour du cycle
-function kpiBud(acc, c, R) {
-  const B = R.buds, tb = r2(B.reduce((a, x) => a + x.budget, 0)), ts = r2(B.reduce((a, x) => a + x.spent, 0));
-  if (!tb) return `<div class="kv1"><span>Budget restant</span><b class="mono">${eurM(0)}</b></div>`;
-  const E = cycEl(c), elPct = R.isPast ? 100 : R.isFut ? 0 : E.pct, t = budTone(acc, ts, tb, elPct), pc = Math.min(100, Math.round(100 * ts / tb)), nOver = B.filter(x => x.over > 0).length;
-  return `<div class="kvb"><div class="kvt"><span>Budget restant</span><span class="mono"><b class="t-${t}">${nbM(R.reserve)} €</b><em> / ${nbM(tb)} € prévus</em></span></div>
-    <div class="bar"><i class="${t}" style="width:${pc}%"></i>${R.isCur ? `<em style="left:${E.pct}%"></em>` : ''}</div>
-    <div class="kvs"><span>${eurM(ts)} dépensés (${Math.round(100 * ts / tb)} %)${nOver ? ` · <b class="t-bad">${nOver} dépassé${nOver > 1 ? 's' : ''}</b>` : ''}</span><span>${R.isCur ? `repère : J${E.k}/${E.n} = ${E.pct} %` : R.isFut ? 'cycle à venir' : 'cycle terminé'}</span></div></div>`;
-}
-// V3.2 : du plus récent au plus ancien (fin de cycle en haut, aujourd'hui, puis le passé jusqu'au départ)
 function vJpj(acc, c, R) {
   const rows = []; let marked = !R.isCur;
-  const todayMark = `<div class="todaymark"><i></i>AUJOURD'HUI · <span class="mono">${eurM(R.soldeActuel)}</span><i></i></div>`;
-  R.days.slice().reverse().forEach(dd => {
-    if (!marked && dd.d <= TODAY_ISO) { rows.push(todayMark); marked = true; }
+  const todayMark = `<div class="todaymark"><i></i>AUJOURD'HUI<i></i></div>`;
+  R.days.forEach(dd => {
+    if (!marked && dd.d > TODAY_ISO) { rows.push(todayMark); marked = true; }
     if (!dd.items.length && !UI.jpjAll) return;
-    const fut = dd.d > TODAY_ISO, l = dd.items, one = l.length === 1 ? l[0] : null, allPrev = l.length && l.every(x => !x.real);
-    const lab = !l.length ? '<span class="mini">—</span>' : one ? `${esc(one.label)}${one.real ? (one.kind === 'todo' ? ' <span class="tag w">à classer</span>' : '') : ` <span class="tag g">${one.late ? 'pas encore vu' : 'prévu'}</span>`}`
-      : `${l.length} mouvements${allPrev ? ' <span class="tag g">prévu</span>' : ''}<small>${l.map(x => `${esc(x.label)} ${eurM(x.v).replace('− ', '−')}`).join(' · ')}</small>`;
-    rows.push(`<div class="dayrow ${fut || allPrev ? 'fut' : ''}"><span class="mono dd">${wd(dd.d)} ${fmtJ(dd.d)}</span><span class="dl">${lab}</span><span class="mono dv">${l.length ? `<span class="${dd.mv > 0 ? 'pos' : ''}">${sgn(dd.mv)}</span>` : ''}<small>${eurM(dd.bal)}</small></span></div>`);
+    const fut = dd.d > TODAY_ISO, l = dd.items, one = l.length === 1 ? l[0] : null;
+    const lab = !l.length ? '<span class="mini">—</span>' : one ? `${esc(one.label)}${one.real ? (one.kind === 'todo' ? ' <span class="tag w">à classer</span>' : '') : ` <span class="mini">· ${one.late ? 'pas encore vu' : 'prévu'}</span>`}`
+      : `${l.length} mouvements<small>${l.map(x => `${esc(x.label)} ${eurM(x.v).replace('− ', '−')}`).join(' · ')}</small>`;
+    rows.push(`<div class="dayrow ${fut || (l.length && l.every(x => !x.real)) ? 'fut' : ''}"><span class="mono dd">${wd(dd.d)} ${fmtJ(dd.d)}</span><span class="dl">${lab}</span><span class="mono dv">${l.length ? `<span class="${dd.mv > 0 ? 'pos' : ''}">${sgn(dd.mv)}</span>` : ''}<small>${eurM(dd.bal)}</small></span></div>`);
   });
   if (!marked) rows.push(todayMark);
-  const finV = R.isPast ? R.realEnd : R.atterSans;
   return `<details class="jpj" id="jpj" ${UI.jpj ? 'open' : ''}><summary>Jour par jour<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></summary>
-    <div class="mini" style="margin:-4px 0 8px">Du plus récent au plus ancien · solde après chaque jour</div>
-    <div class="jpjend"><span>Fin de cycle · ${wd(c.fin)} ${fmtJ(c.fin)}<small>${R.isPast ? 'réel' : 'sans budget'}</small></span><b class="mono t-${tone(acc, finV)}">${sgnM(finV)}</b></div>
+    <div class="dayhead2"><span>Départ ${fmtJ(c.debut)}</span><span class="mono">${eurM(R.depart)}</span></div>
     ${rows.join('')}
-    <div class="dayfoot"><span>Départ · ${wd(c.debut)} ${fmtJ(c.debut)}</span><span class="mono">${eurM(R.depart)}</span></div>
     <button class="linkbtn" data-jpjall="1">${UI.jpjAll ? 'Masquer les jours sans mouvement' : 'Afficher aussi les jours sans mouvement'}</button></details>`;
 }
 
@@ -1303,13 +1282,13 @@ function vFixes(acc, c, R, head) {
 function vBud() {
   const acc = UI.acc; if (!started3(acc)) return vStart(acc);
   const c = selCycle(acc), R = cycleCalc(acc, c), B = R.buds;
-  const tb = r2(B.reduce((a, x) => a + x.budget, 0)), ts = r2(B.reduce((a, x) => a + x.spent, 0)), E = cycEl(c), elPct = R.isPast ? 100 : R.isFut ? 0 : E.pct;
+  const tb = r2(B.reduce((a, x) => a + x.budget, 0)), ts = r2(B.reduce((a, x) => a + x.spent, 0));
   const others = budgetsOf(acc).filter(b => !(num(b.budget) > 0));
   return `<section class="view"><div class="rowhead"><h2 class="title">Budgets</h2></div>
     ${cycNav(acc, c)}
-    <div class="tiles3"><div><small>Budget</small><b class="mono">${eurM(tb)}</b></div><div><small>Dépensé</small><b class="mono">${eurM(ts)}</b></div><div><small>À réserver</small><b class="mono t-${budTone(acc, ts, tb, elPct)}">${eurM(R.reserve)}</b></div></div>${R.isCur && tb ? `<p class="hint" style="margin:0">Le trait marque le jour du cycle (J${E.k}/${E.n}) : vert tant que tu dépenses à ce rythme, orange si tu vas plus vite, rouge si c'est dépassé.</p>` : ''}
-    <div class="list">${B.length ? B.map(x => { const pc = x.budget ? Math.min(100, Math.round(100 * x.spent / x.budget)) : 0, t = budTone(acc, x.spent, x.budget, elPct);
-      return `<button class="env2" data-bid="${esc(x.b.id)}"><span class="t"><b>${esc(x.nom)}</b><span class="mono">${eurM(x.spent)} / ${eurM(x.budget).replace(',00', '')}</span></span><span class="bar"><i class="${t}" style="width:${x.over ? 100 : pc}%"></i>${R.isCur ? `<em style="left:${E.pct}%"></em>` : ''}</span><span class="mono mini t-${t}">${x.over ? '▲ dépassé de ' + eurM(x.over) : 'reste ' + eurM(x.reste)}</span></button>`; }).join('') : '<div class="empty">Aucun budget.</div>'}</div>
+    <div class="tiles3"><div><small>Budget</small><b class="mono">${eurM(tb)}</b></div><div><small>Dépensé</small><b class="mono">${eurM(ts)}</b></div><div><small>À réserver</small><b class="mono acc">${eurM(R.reserve)}</b></div></div>
+    <div class="list">${B.length ? B.map(x => { const pc = x.budget ? Math.min(100, Math.round(100 * x.spent / x.budget)) : 0;
+      return `<button class="env2" data-bid="${esc(x.b.id)}"><span class="t"><b>${esc(x.nom)}</b><span class="mono">${eurM(x.spent)} / ${eurM(x.budget).replace(',00', '')}</span></span><span class="bar"><i class="${x.over ? 'over' : ''}" style="width:${x.over ? 100 : pc}%"></i></span><span class="mono mini ${x.over ? 'warnt' : ''}">${x.over ? '▲ dépassé de ' + eurM(x.over) : 'reste ' + eurM(x.reste)}</span></button>`; }).join('') : '<div class="empty">Aucun budget.</div>'}</div>
     <button class="btn dashed" data-newbud="1">+ Ajouter un budget</button>
     ${others.length ? `<details class="plain"><summary>Catégories sans budget · ${others.length}</summary><div class="list">${others.map(b => `<button class="item" data-bid="${esc(b.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(b.nom)}</b></span><span class="mini">ajouter un budget ›</span></button>`).join('')}</div></details>` : ''}
     <p class="hint">Les ponctuels classés dans une catégorie budgétée réduisent son reste. Le reste à réserver d'un cycle en cours est déduit de l'atterrissage ; pour un cycle à venir, c'est le budget complet ; un cycle fini ne réserve plus rien.</p></section>`;
@@ -1341,14 +1320,12 @@ function vCal() {
     const R = cycleCalc(acc, c), isC = c.i === cur.i, k = departKind(c);
     const banque = c.sal ? `<span class="ok">✓ vu à la banque${c.man.includes('d') && c.sal.date !== c.debut ? ' le ' + fmtJ(c.sal.date) : ''}</span>` : c.debut > TODAY_ISO ? (c.row.debut ? '' : 'estimé') : c.i === 0 ? '' : '<span class="warnt">pas encore vu</span>';
     const xtra = [c.detail.rappel ? `+${c.detail.hausse} % et rattrapage` : '', ...c.detail.primes.map(p => '+ ' + p.nom)].filter(Boolean).join(' · ');
-    const fin = R.isPast ? R.realEnd : R.atterAvec, ev = r2(fin - R.depart);
-    return `<button class="cyrow c4 ${isC ? 'cur' : ''}" data-cycm="${esc(c.mois)}"><span class="a"><b>${esc(MONTHS_L[pm(c.mois).m])}${pm(c.mois).y !== pm(S.mois).y ? ' ' + pm(c.mois).y : ''}${isC ? ' <i class="en">EN COURS</i>' : ''}</b><small><span class="mono">${fmtJ(c.debut)}</span> · ${eurM(c.montant).replace(',00', '')}${xtra ? ' <b class="acc2">' + esc(xtra) + '</b>' : ''}${c.man.includes('d') ? ' · date saisie' : ''}${banque ? ' · ' + banque : ''}</small><small>départ : ${esc(k)}</small></span>
-      <span class="mono n">${nbM(R.depart)}</span><span class="mono n t-${tone(acc, fin)}">${nbM(fin)}</span><span class="mono n t-${evTone(ev)}">${sgnN(ev)}</span></button>`;
+    return `<button class="cyrow ${isC ? 'cur' : ''}" data-cycm="${esc(c.mois)}"><span class="a"><b>${esc(MONTHS_L[pm(c.mois).m])}${pm(c.mois).y !== pm(S.mois).y ? ' ' + pm(c.mois).y : ''}${isC ? ' <i class="en">EN COURS</i>' : ''}</b><small><span class="mono">${fmtJ(c.debut)}</span> · ${eurM(c.montant).replace(',00', '')}${xtra ? ' <b class="acc2">' + esc(xtra) + '</b>' : ''}${c.man.includes('d') ? ' · date saisie' : ''}${banque ? ' · ' + banque : ''}</small></span>
+      <span class="b"><span class="mono">${eurM(R.depart)} → ${eurM(R.isPast ? R.realEnd : R.atterAvec)}</span><small>départ : ${esc(k)}</small></span></button>`;
   }).join('');
   return `<section class="view">${backPlus}<h2 class="title">Calendrier salaires</h2>${calTabs(acc)}
     <p class="hint" style="font-size:13px;margin:-8px 0 0">${P ? 'Un cycle va du jour du salaire à la veille du suivant.' : `Le cycle commence à l'arrivée du ${esc(salLabel(acc).toLowerCase().startsWith('virement') ? salLabel(acc) : 'virement')} ; tant qu'il n'est pas arrivé, la date est estimée au ${defJour(acc)}.`} Touche un cycle pour modifier sa date, son montant ou son solde de départ.</p>
-    <div class="list"><div class="cyrow c4 h"><span>CYCLE · ${P ? 'SALAIRE' : esc(salLabel(acc).toUpperCase())}</span><span>DÉBUT</span><span>FIN</span><span>ÉVOL.</span></div>${rows}</div>
-    <p class="hint" style="font-size:12px;margin:-4px 0 0">Début : solde au départ du cycle. Fin : atterrissage avec budget (réel pour un cycle fini). Évolution : fin − début.</p>
+    <div class="list"><div class="cyrow h"><span>CYCLE · ${P ? 'SALAIRE' : esc(salLabel(acc).toUpperCase())}</span><span>DÉPART → ARRIVÉE</span></div>${rows}</div>
     <div class="hero" style="gap:10px"><h2>Réglages du cycle</h2>
       <div class="two"><div class="field"><label for="cfJ">Jour habituel (estimation)</label><input id="cfJ" data-cfj="${esc(acc)}" inputmode="numeric" value="${esc(defJour(acc))}"></div>
       ${P ? '' : `<div class="field"><label for="cfN">Nom du virement</label><input id="cfN" data-cfn="${esc(acc)}" value="${esc(param('v3nomrev|' + acc, ''))}" placeholder="Ex. Virement du conjoint"></div>`}</div>
@@ -1417,14 +1394,13 @@ function vMpm(acc) {
   const L = (UI.mpm === 'y' ? Array.from({ length: 12 }, (_, i) => y + '-' + pad(i + 1)).map(k => ({ k, c: cy.find(c => c.mois === k) || null })) : cy.slice(cur.i, cur.i + 12).map(c => ({ k: c.mois, c })))
     .map(x => { if (!x.c) return { k: x.k, v: null }; const R = cycleCalc(acc, x.c); return { k: x.k, c: x.c, v: R.isPast ? R.realEnd : R.atterAvec, d: R.depart, st: R.isPast ? 'real' : R.isCur ? 'cur' : 'fut' }; });
   const ok = L.filter(x => x.v !== null), low = ok.reduce((m, x) => !m || x.v < m.v ? x : m, null), neg = ok.find(x => x.v < 0);
-  const rows = L.map(x => x.v === null ? `<div class="mrow m4 off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini" style="grid-column:2/5;text-align:left">avant le suivi</span></div>`
-    : `<button class="mrow m4 ${x.st}" data-gocyc="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono">${nbM(x.d)}</span><span class="mono t-${tone(acc, x.v)}">${nbM(x.v)}</span><span class="mono t-${evTone(x.v - x.d)}">${sgnN(r2(x.v - x.d))}</span></button>`).join('');
+  const rows = L.map(x => x.v === null ? `<div class="mrow off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini">avant le suivi</span><span></span></div>`
+    : `<button class="mrow ${x.st}" data-gocyc="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono mini">${nbM(x.d)} → ${nbM(x.v)}</span><span class="mono ${x.v - x.d >= 0 ? 'pos' : 'warnt'}">${sgn(r2(x.v - x.d))}</span></button>`).join('');
   return `<details class="jpj" id="mpm" ${UI.mpmOpen ? 'open' : ''}><summary>Mois par mois<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></summary>
     <div class="mpmbody">${mpmSeg('mpm', UI.mpm)}
-    <div class="mini">Atterrissage avec budget, fin de chaque cycle${neg ? ` · <b class="t-bad">▼ négatif en ${esc(MONTHS_L[pm(neg.k).m])}</b>` : low ? ` · point le plus bas : <b class="mono">${eurM(low.v)}</b> en ${esc(MONTHS_L[pm(low.k).m])}` : ''}</div>
+    <div class="mini">Atterrissage avec budget, fin de chaque cycle${neg ? ` · <b class="warnt">▼ négatif en ${esc(MONTHS_L[pm(neg.k).m])}</b>` : low ? ` · point le plus bas : <b class="mono">${eurM(low.v)}</b> en ${esc(MONTHS_L[pm(low.k).m])}` : ''}</div>
     ${lineSvg(L.map(x => ({ lab: iniM(x.k), v: x.v, st: x.st })), 'Atterrissage avec budget, mois par mois')}${legend}
-    <div class="mini">Début : solde au départ du cycle. Fin : atterrissage avec budget (réel pour un cycle fini). Évolution : fin − début.</div>
-    <div class="mrows"><div class="mrow m4 h"><span>MOIS</span><span>DÉBUT</span><span>FIN</span><span>ÉVOLUTION</span></div>${rows}</div><p class="hint">Touche un mois pour ouvrir son cycle.</p></div></details>`;
+    <div class="mrows">${rows}</div><p class="hint">Touche un mois pour ouvrir son cycle.</p></div></details>`;
 }
 
 /* ================= V3.1 : Calendrier > Évolution du salaire ================= */
@@ -1546,9 +1522,8 @@ function vEpaMpm(acc, Ls) {
     ${Ls.length > 1 ? `<div class="chips">${[['tot', 'Total']].concat(Ls.map(L => [L.id, L.nom])).map(([id, n]) => `<button class="chip" data-eps="${esc(id)}" aria-pressed="${(UI.epS === id) || (id === 'tot' && sel === Ls)}">${esc(n)}</button>`).join('')}</div>` : ''}
     <div class="mini">${sel.length > 1 ? 'Épargne totale' : esc(sel[0].nom)} en fin de mois · point zéro <b class="mono">${eurM(pz)}</b> au ${fmtJ(sel[0].dateZero)}</div>
     ${lineSvg(rows.map(x => ({ lab: iniM(x.k), v: x.v, st: x.st })), 'Épargne, mois par mois')}${legend}
-    <div class="mini">Début et fin : solde en début et en fin de mois. Évolution : versé − retiré + intérêts.</div>
-    <div class="mrows"><div class="mrow m4 h"><span>MOIS</span><span>DÉBUT</span><span>FIN</span><span>ÉVOLUTION</span></div>${rows.map(x => x.v === null ? `<div class="mrow m4 off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini" style="grid-column:2/5;text-align:left">avant le point zéro</span></div>`
-      : `<button class="mrow m4 ${x.st}" data-epgo="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono">${nbM(r2(x.v - x.net))}</span><span class="mono b">${nbM(x.v)}</span><span class="mono t-${evTone(x.net)}">${sgnN(x.net)}</span></button>`).join('')}</div>
+    <div class="mrows"><div class="mrow h"><span>MOIS</span><span>VERSÉ − RETIRÉ</span><span>SOLDE FIN</span></div>${rows.map(x => x.v === null ? `<div class="mrow off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini">avant le point zéro</span><span></span></div>`
+      : `<button class="mrow ${x.st}" data-epgo="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono ${x.net >= 0 ? 'pos' : 'warnt'}">${sgn(x.net)}</span><span class="mono">${eurM(x.v)}</span></button>`).join('')}</div>
     <p class="hint">Les mois prévus viennent des charges fixes et des prévues liées aux livrets.</p></div></details>`;
 }
 function vEpl() {
@@ -1617,7 +1592,6 @@ function vSet() {
   const syncTxt = { ok: 'Synchronisé', wait: 'Envoi en cours…', off: 'Hors ligne', err: 'Accès coupé' }[SYNC.state] || '';
   const accBlock = A => `<div class="env" style="gap:8px"><div class="field"><label for="an-${esc(A.id)}">Nom du compte</label><input id="an-${esc(A.id)}" data-accname="${esc(A.id)}" value="${esc(A.nom)}"></div>
     <div class="mini">${A.proprietaire ? 'Compte privé' : DB.profils.length > 1 ? 'Compte partagé' : ''}${started3(A.id) ? ` · suivi depuis le ${fmtJA(v3(A.id).debut)}` : ' · suivi pas encore démarré'}</div>
-    ${started3(A.id) ? colBlock(A.id) : ''}
     ${started3(A.id) ? `<div class="actions" id="rs-${esc(A.id)}"><button class="btn danger small" data-reset="${esc(A.id)}">Recommencer le suivi de ce compte</button></div>` : ''}</div>`;
   return `<section class="view">${backPlus}<h2 class="title">Réglages</h2>
     ${vBankSet()}
@@ -1632,19 +1606,10 @@ function vSet() {
       <button class="btn ghost small" data-syncnow="1">Synchroniser maintenant</button></div>
   </section>`;
 }
-function colBlock(id) {
-  const S = colSet(id), sv = nbM(S.seuil).replace(',00', '');
-  return `<div class="colset"><b>Couleurs de l'accueil</b>
-    <div class="two"><div class="field"><label for="cs-${esc(id)}">Seuil du vert (€)</label><input id="cs-${esc(id)}" inputmode="decimal" data-colseuil="${esc(id)}" value="${esc(String(S.seuil).replace('.', ','))}"></div>
-    <div class="field"><label for="cm-${esc(id)}">Marge du rythme (points)</label><input id="cm-${esc(id)}" inputmode="numeric" data-colmarge="${esc(id)}" value="${esc(String(S.marge))}"></div></div>
-    <div class="chips3"><span class="mini">Atterrissage :</span><span class="pill bad">sous 0</span><span class="pill warn">0 à ${sv}</span><span class="pill good">${sv} et plus</span></div>
-    <div class="hint">Budgets : orange si tu dépenses plus de ${esc(String(S.marge))} points plus vite que le cycle avance, rouge si le budget est dépassé.</div></div>`;
-}
 function resetOps3(acc) {
   const ops = [];
   ['mouvements', 'recurrents', 'cycles', 'prevues', 'apprentissage'].forEach(k => DB[k].filter(r => r.compte === acc).forEach(r => ops.push(del(TABS[k], r.id))));
   ops.push(del('Parametres', 'v3|' + acc));
-  if (DB.reglages.some(r => r.id === acc + '|v3')) ops.push(del('Reglages', acc + '|v3'));
   return ops;
 }
 
@@ -1824,7 +1789,7 @@ document.addEventListener('change', ev => {
   if (ds.sc !== undefined) { simOf(UI.acc).credits[+ds.sc][ds.f] = el.value; saveSim(); simRefresh(); return; }
   if (ds.accname) { const v = el.value.trim(); if (v) commit([upd('Comptes', { id: ds.accname, nom: v })]); return; }
   if (ds.prof) { const v = el.value.trim(); if (v) commit([upd('Profils', { id: ds.prof, nom: v })]); return; }
-  if (ds.cfj) { const j = Math.min(31, Math.max(1, num(el.value) || 26)), S = v3(ds.cfj); const S2 = Object.assign({}, S, { jour: j }); if (S) commit([DB.reglages.some(r => r.id === ds.cfj + '|v3') ? regOp(ds.cfj, 'v3', S2) : upd('Parametres', { cle: 'v3|' + ds.cfj, valeur: JSON.stringify(S2) })]); return; }
+  if (ds.cfj) { const j = Math.min(31, Math.max(1, num(el.value) || 26)), S = v3(ds.cfj); if (S) commit([upd('Parametres', { cle: 'v3|' + ds.cfj, valeur: JSON.stringify(Object.assign({}, S, { jour: j })) })]); return; }
   if (ds.cfn) { commit([upd('Parametres', { cle: 'v3nomrev|' + ds.cfn, valeur: el.value.trim() })]); return; }
   if (el.id === 'onbC') { ONB.commun = el.checked; return; }
   if (ds.bksel) { BK.sel[ds.bksel] = el.value; render(); return; }
@@ -1962,9 +1927,6 @@ document.addEventListener('click', ev => {
 });
 document.addEventListener('change', ev => {
   const el = ev.target, ds = el.dataset || {}, acc = UI.acc;
-  if (ds.colseuil || ds.colmarge) { const a = ds.colseuil || ds.colmarge, S = colSet(a), v = num(el.value);
-    if (ds.colseuil) S.seuil = v === null ? 100 : Math.max(0, r2(v)); else S.marge = v === null ? 10 : Math.max(0, Math.min(100, Math.round(v)));
-    commit([regOp(a, 'couleurs', S)]); render(); return; }
   if (ds.evo) { saveEvo(acc, P => { P[ds.evo] = +el.value; }); return; }
   if (ds.evoh) { const v = num(el.value); saveEvo(acc, P => { P.hausses = P.hausses || {}; if (v === null) delete P.hausses[ds.evoh]; else P.hausses[ds.evoh] = v; }); return; }
   if (ds.evp) { saveEvo(acc, P => { const p = (P.primes || []).find(x => x.id === ds.evp); if (!p) return; p[ds.f] = ds.f === 'mois' || ds.f === 'jour' ? +el.value || '' : el.value.trim(); }); return; }
@@ -1992,316 +1954,6 @@ document.addEventListener('submit', ev => {
     commit([upd('MvtsLivret', { id: uid(), compte: L.compte, livret: L.id, date: TODAY_ISO, montant: delta, type: 'interets', libelle: 'Intérêts (recalage)' })]);
     toast('Recalé : ' + sgn(delta) + ' en intérêts'); return;
   }
-});
-/* ================= V3.3 : bilan du cycle (perso et commun), prévision enregistrée, barre du cycle ================= */
-const prevOf = id => DB.prevues.find(p => p.id === id);
-const isComTr = cat => /commun/i.test(cat || '');
-const isEpaCat = cat => /^(é|e)pargne|^investissement|^livret/i.test(cat || ''); // virements d'épargne pas (encore) liés à un livret
-const plur = (n, s) => n + ' ' + s + (n > 1 ? 's' : '');
-const pctTxt = (a, b) => b > 0 ? Math.round(100 * a / b) + ' %' : '';
-
-// Prévision enregistrée au premier affichage de chaque cycle (Reglages, clé snap|<mois>) : base du « prévu / réel »
-const snapOf = (acc, mois) => regJ(acc, 'snap|' + mois);
-let SNAPT = 0;
-function snapLater() { if (!SNAPT) SNAPT = setTimeout(() => { SNAPT = 0; snapCheck(); }, 1200); }
-function snapCheck() {
-  if (!LOADED || !ME || !DB.reglages) return;
-  const ops = [];
-  accs().forEach(a => {
-    if (!started3(a.id)) return; const c = curCycle(a.id); if (!c || c.debut > TODAY_ISO || snapOf(a.id, c.mois)) return;
-    const R = cycleCalc(a.id, c); if (R.todo) return; // pas tant qu'il reste des opérations à classer : la prévision serait fausse
-    ops.push(regOp(a.id, 'snap|' + c.mois, { d: TODAY_ISO, late: dDiff(c.debut, TODAY_ISO) > 1, atterAvec: R.atterAvec, atterSans: R.atterSans, depart: R.depart }));
-  });
-  // enregistré sans réafficher l'écran (rien de visible ne change ; une saisie en cours n'est pas perdue)
-  if (ops.length) { clean(ops); QUEUE.push(...ops); store.set('le31-file', QUEUE); ops.forEach(applyLocal); CACHE = {}; if (UI.tab === 'bil') render(); flush(); }
-}
-
-// Répartition de toutes les lignes du cycle (réelles et prévues) : rentrées, fixes, budgets, hors budget, épargne, à classer
-function bilanOf(acc, c) {
-  const ck = 'bil|' + acc + '|' + c.mois; if (CACHE[ck]) return CACHE[ck];
-  const R = cycleCalc(acc, c), budCats = new Set(R.buds.map(x => x.nom));
-  const recL = id => { const r = recOf(id); return r && r.livret ? r.livret : ''; };
-  const B = { rent: [], fixe: [], bud: [], hors: [], epa: [], todo: [] };
-  R.real.forEach(o => {
-    const v = num(o.montant) || 0, it = { v, label: nameOf(o), cat: o.categorie || '', d: o.date, real: true, id: o.id, kind: o.type || 'todo', lien: o.lien || '' };
-    if (o.type === 'epargne' || (o.type === 'fixe' && recL(o.lien)) || ((o.type === 'fixe' || o.type === 'ponct') && isEpaCat(o.categorie))) { it.liv = o.livret || recL(o.lien); B.epa.push(it); }
-    else if (!o.type) B.todo.push(it);
-    else if (o.type === 'ponct' && budCats.has(o.categorie)) B.bud.push(it);
-    else if (v > 0) B.rent.push(it);
-    else if (o.type === 'fixe') B.fixe.push(it);
-    else B.hors.push(it);
-  });
-  R.proj.forEach(p => {
-    const it = { v: p.v, label: p.label, cat: p.cat || (p.kind === 'sal' ? salLabel(acc) : p.kind === 'prime' ? 'Primes' : ''), d: p.d, real: false, id: p.id || '', kind: p.kind };
-    const liv = p.kind === 'fixe' ? recL(p.id) : p.kind === 'prev' ? ((prevOf(p.id) || {}).livret || '') : '';
-    if (liv || ((p.kind === 'fixe' || p.kind === 'prev') && p.v < 0 && isEpaCat(p.cat))) { it.liv = liv; B.epa.push(it); }
-    else if (p.v > 0) B.rent.push(it);
-    else if (p.kind === 'fixe') B.fixe.push(it);
-    else B.hors.push(it);
-  });
-  const S = l => r2(l.reduce((a, x) => a + x.v, 0));
-  const T = { rent: S(B.rent), fixe: -S(B.fixe), budSpent: -S(B.bud), reserve: R.reserve, hors: -S(B.hors), epa: -S(B.epa), todo: -S(B.todo) };
-  T.bud = r2(T.budSpent + T.reserve);
-  const fin = R.isPast ? R.realEnd : R.atterAvec;
-  T.com = r2(-S(B.fixe.concat(B.hors).filter(x => isComTr(x.cat))));
-  T.capa = r2(T.rent - T.fixe - T.bud - T.hors - T.todo);
-  const res = { R, c, B, T, fin, depart: R.depart, st: R.isPast ? 'past' : R.isFut ? 'fut' : 'cur' };
-  return (CACHE[ck] = res);
-}
-
-// Où part l'argent : sorties hors épargne, par catégorie (budgets : dépensé + réservé tant que le cycle n'est pas fini)
-function bilCats(acc, b, withCom) {
-  const g = {}, add = (k, v, kind, lab, fut) => { const x = g[k] = g[k] || { cat: k, v: 0, kinds: new Set(), items: [] }; x.v = r2(x.v + v); x.kinds.add(kind); if (lab) x.items.push({ lab, v, fut }); };
-  b.B.fixe.forEach(x => add(x.cat || x.label, -x.v, 'fixe', x.label, !x.real));
-  b.B.hors.forEach(x => add(x.cat || x.label, -x.v, 'hors', x.label, !x.real));
-  b.B.todo.forEach(x => add('À classer', -x.v, 'todo', x.label, false));
-  b.R.buds.forEach(x => add(x.nom, b.R.isPast ? x.spent : r2(x.spent + (b.R.isFut ? x.budget : x.reste)), 'budget', null));
-  return Object.values(g).filter(x => x.v > 0.004 && (withCom || !isComTr(x.cat))).sort((a, b2) => b2.v - a.v);
-}
-
-// Apports au commun : rentrées du cycle du compte commun, besoin du cycle, marge et part de chacun
-function apportsOf(acc, b) {
-  const L = {}; b.B.rent.forEach(x => { const k = x.kind === 'sal' ? salLabel(acc) : x.label; L[k] = r2((L[k] || 0) + x.v); });
-  const ap = Object.entries(L).map(([lab, v]) => ({ lab, v })).sort((a, b2) => b2.v - a.v);
-  const tot = r2(ap.reduce((a, x) => a + x.v, 0));
-  const obj = r2(livretsOf(acc).reduce((a, l) => a + (num(l.objectif) || 0), 0)), epa = Math.max(obj, b.T.epa), seuil = colSet(acc).seuil;
-  const besoin = r2(b.T.fixe + b.T.bud + b.T.hors + b.T.todo + epa + seuil);
-  const marge = r2(tot + b.depart - besoin), part = r2(besoin - b.depart);
-  return { ap, tot, obj, epa, seuil, besoin, marge, part, tone: marge >= -0.004 ? 'good' : marge >= -seuil ? 'warn' : 'bad' };
-}
-function myApport(acc, b) {
-  if (!isPerso(acc)) return null;
-  const com = accs().find(a => !isPerso(a.id) && started3(a.id)); if (!com || !(b.T.com > 0)) return null;
-  const cc = cycleByMois(com.id, b.c.mois); if (!cc) return null;
-  const bc = bilanOf(com.id, cc), A = apportsOf(com.id, bc); if (!(A.tot > 0)) return null;
-  const share = Math.min(1, b.T.com / A.tot), mine = r2(share * A.part);
-  return { com: com.id, v: b.T.com, share, mine, diff: r2(b.T.com - mine), A };
-}
-
-// Écarts entre prévu au début du cycle et réel (cycle terminé, ou en cours si la prévision existe)
-function bilDiffs(acc, b) {
-  const R = b.R, c = b.c, out = [];
-  R.buds.forEach(x => { const d = r2(x.budget - x.spent); if (Math.abs(d) >= 0.5 && (R.isPast || d < 0)) out.push({ lab: x.nom, sub: `${eurM(x.spent).replace(',00', '')} pour ${eurM(x.budget).replace(',00', '')} prévus`, v: d }); });
-  b.B.fixe.concat(b.B.rent).filter(x => x.real && x.kind === 'fixe' && x.lien).forEach(x => {
-    const r = recOf(x.lien); if (!r) return; const m = num(r.montant) || 0, d = r2(x.v - (r.sens === '+' ? m : -m));
-    if (Math.abs(d) >= 0.5) out.push({ lab: r.libelle, sub: `${eurM(Math.abs(x.v)).replace(',00', '')} au lieu de ${eurM(m).replace(',00', '')}`, v: d });
-  });
-  if (R.isPast) DB.recurrents.filter(r => r.compte === acc && !r.livret && r.actif !== 'non').forEach(r => {
-    const occ = occDates(r, c.debut, c.fin).length, seen = R.real.filter(o => o.type === 'fixe' && o.lien === r.id).length, m = num(r.montant) || 0;
-    if (occ > seen && m) out.push({ lab: r.libelle, sub: 'pas passée', v: r2((occ - seen) * (r.sens === '+' ? -m : m)) });
-  });
-  const sal = R.real.filter(o => o.type === 'sal');
-  if (sal.length && c.montant) { const d = r2(sal.reduce((a, o) => a + (num(o.montant) || 0), 0) - c.montant); if (Math.abs(d) >= 0.5) out.push({ lab: salLabel(acc), sub: `${eurM(c.montant + d)} au lieu de ${eurM(c.montant)}`, v: d }); }
-  b.B.hors.filter(x => x.real && !prevOf(x.lien)).forEach(x => out.push({ lab: x.label, sub: (x.cat || 'sans catégorie') + ' · hors budget', v: x.v }));
-  b.B.epa.filter(x => x.real && x.kind === 'epargne').forEach(x => out.push({ lab: x.label, sub: x.v < 0 ? 'épargne en plus' : 'retrait d\'un livret', v: x.v }));
-  if (b.B.todo.length) out.push({ lab: 'À classer', sub: plur(b.B.todo.length, 'opération'), v: r2(-b.T.todo) });
-  return out.sort((a, b2) => Math.abs(b2.v) - Math.abs(a.v));
-}
-
-// Comparaison avec les cycles terminés précédents (dès 2)
-function bilTrend(acc, b) {
-  const cy = cyclesOf(acc), prev = cy.slice(Math.max(0, b.c.i - 3), b.c.i).filter(p => p.fin < TODAY_ISO);
-  if (prev.length < 2) return null;
-  const avg = {}; prev.forEach(p => bilCats(acc, bilanOf(acc, p), true).forEach(x => { avg[x.cat] = r2((avg[x.cat] || 0) + x.v / prev.length); }));
-  const cur = Object.fromEntries(bilCats(acc, b, true).map(x => [x.cat, x.v]));
-  const keys = new Set(Object.keys(avg).concat(Object.keys(cur)));
-  const L = [...keys].map(k => ({ cat: k, v: cur[k] || 0, a: avg[k] || 0, d: r2((cur[k] || 0) - (avg[k] || 0)) }))
-    .filter(x => Math.abs(x.d) >= Math.max(10, 0.2 * Math.max(x.a, x.v))).sort((x, y) => Math.abs(y.d) - Math.abs(x.d)).slice(0, 4);
-  return { n: prev.length, L, capa: r2(prev.reduce((a, p) => a + bilanOf(acc, p).T.capa, 0) / prev.length) };
-}
-
-// Suggestions : une catégorie au-dessus de son budget deux cycles de suite
-function bilSugg(acc, b) {
-  if (!b.R.isPast || b.c.i < 1) return [];
-  const pc = cyclesOf(acc)[b.c.i - 1], P = cycleCalc(acc, pc);
-  return b.R.buds.filter(x => x.over > 0).map(x => {
-    const px = P.buds.find(y => y.nom === x.nom); if (!px || !(px.over > 0)) return null;
-    if (store.get('le31-sugno|' + acc + '|' + x.nom + '|' + b.c.mois, false)) return null;
-    return { b: x.b, nom: x.nom, v: Math.ceil(Math.max(x.spent, px.spent) / 10) * 10, cur: x.budget };
-  }).filter(Boolean);
-}
-
-/* ----- Affichage ----- */
-// Barre du cycle (V3.3, proposition A) : jours restants, bulle « Aujourd'hui », dates et prochaine paie
-function cycLeft(acc, c) {
-  const E = cycEl(c), isPast = c.fin < TODAY_ISO, isCur = !isPast && c.debut <= TODAY_ISO, rest = E.n - E.k;
-  return isCur ? (rest ? `encore ${plur(rest, 'jour')}` : 'dernier jour du cycle') : isPast ? 'cycle terminé' : `commence dans ${plur(dDiff(TODAY_ISO, c.debut), 'jour')}`;
-}
-function cycBar(acc, c) {
-  const E = cycEl(c), isPast = c.fin < TODAY_ISO, isCur = !isPast && c.debut <= TODAY_ISO;
-  const nx = cyclesOf(acc)[c.i + 1], pay = nx ? nx.debut : addD(c.fin, 1), rest = E.n - E.k;
-  const pct = isCur ? Math.round(1000 * (E.k - 0.5) / E.n) / 10 : isPast ? 100 : 0;
-  const tx = pct < 14 ? '0' : pct > 86 ? '-100%' : '-50%';
-  return `<div class="cycbar">
-    <div class="cbtrack${isCur ? ' cur' : ''}">${isCur ? `<span class="cbbub" style="left:${pct}%;transform:translateX(${tx})">Aujourd'hui · J${E.k}</span><span class="cbtip" style="left:${pct}%"></span>` : ''}<div class="cbbar"><i style="width:${pct}%"></i></div></div>
-    <div class="cbd"><span class="mono">${wd(c.debut)} ${fmtJ(c.debut)}</span><span>${isPerso(acc) ? 'paie' : 'virement'} le <b>${wd(pay)} ${fmtJ(pay)}</b></span><span class="mono">${wd(c.fin)} ${fmtJ(c.fin)}</span></div></div>`;
-}
-function bilBtn(acc, c, R) {
-  const E = cycEl(c), t = R.isCur ? 'Bilan du cycle' : R.isPast ? 'Bilan ' + deMois(c.mois) : 'Bilan prévu';
-  const s = R.isCur ? `Provisoire · J${E.k}/${E.n} · où part l'argent, écarts, épargne` : R.isPast ? 'Cycle clôturé · prévu, réel et ce qui a fait la différence' : 'Cycle à venir · tout est prévu';
-  return `<button class="bilbtn" data-bilan="1"><span class="bi"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></span><span class="bt"><b>${t}</b><small>${s}</small></span><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="chev"><path d="M9 6l6 6-6 6"/></svg></button>`;
-}
-function bilBanner(acc, c, R) {
-  if (!R.isCur || c.i < 1 || dDiff(c.debut, TODAY_ISO) > 4) return '';
-  const p = cyclesOf(acc)[c.i - 1]; if (store.get('le31-bilvu|' + acc + '|' + p.mois, false)) return '';
-  return `<div class="banner"><span>Le bilan ${deMois(p.mois)} est prêt.</span><span style="display:flex;gap:6px"><button class="btn small" data-bilan="${esc(p.mois)}">Voir</button><button class="btn small ghost" data-bilvu="${esc(p.mois)}" aria-label="Masquer">✕</button></span></div>`;
-}
-
-const bilRow = (lab, v, o = {}) => `<div class="brow${o.cls ? ' ' + o.cls : ''}"><span>${o.dot ? `<i class="bdot" style="background:${o.dot}"></i>` : ''}${lab}${o.sub ? ` <small>${o.sub}</small>` : ''}</span><span class="${o.txt ? 'txt' : 'mono'}${o.t ? ' t-' + o.t : ''}">${v}</span></div>`;
-const pill = (t, txt) => `<span class="bpill ${t}">${txt}</span>`;
-
-function vBil() {
-  const acc = UI.acc; if (!started3(acc)) return vStart(acc);
-  const c = selCycle(acc), b = bilanOf(acc, c), R = b.R, T = b.T, E = cycEl(c), P = isPerso(acc), snap = snapOf(acc, c.mois);
-  const cy = cyclesOf(acc), cur = curCycle(acc), seuil = colSet(acc).seuil, elPct = R.isPast ? 100 : R.isFut ? 0 : E.pct;
-  const st = R.isCur ? pill('warn', 'PROVISOIRE') : R.isPast ? pill('muted', 'CLÔTURÉ') : pill('acc', 'PRÉVU');
-  const sub = R.isCur ? `${fmtJ(c.debut)} → ${fmtJ(c.fin)} · J${E.k}/${E.n} · réel au ${fmtJ(TODAY_ISO)} + prévu jusqu'à la fin` : R.isPast ? `${fmtJ(c.debut)} → ${fmtJ(c.fin)} · cycle terminé · tout est réel` : `${fmtJ(c.debut)} → ${fmtJ(c.fin)} · cycle à venir · tout est prévu`;
-  const tb = r2(R.buds.reduce((a, x) => a + x.budget, 0)), ts = r2(R.buds.reduce((a, x) => a + x.spent, 0)), bt = budTone(acc, ts, tb, elPct);
-  const livs = livretsOf(acc), byLiv = id => r2(-b.B.epa.filter(x => x.liv === id).reduce((a, x) => a + x.v, 0));
-  const objs = livs.filter(l => (num(l.objectif) || 0) > 0).map(l => ({ l, v: byLiv(l.id), o: num(l.objectif) }));
-  const manque = r2(objs.reduce((a, x) => a + Math.max(0, x.o - x.v), 0));
-  const fixFut = b.B.fixe.filter(x => !x.real), worst = R.buds.map(x => ({ x, t: budTone(acc, x.spent, x.budget, elPct) })).filter(y => y.t !== 'good').sort((p, q) => (q.t === 'bad') - (p.t === 'bad') || q.x.spent / q.x.budget - p.x.spent / p.x.budget)[0];
-  const A = P ? null : apportsOf(acc, b), mine = P ? myApport(acc, b) : null;
-
-  // En bref
-  const lines = [];
-  if (A && A.tot > 0) lines.push(bilRow('Apports', `${eurM(A.tot).replace(',00', '')} · ${A.marge >= 0 ? 'suffisants' : 'il manque ' + eurM(-A.marge).replace(',00', '')}`, { dot: `var(--${A.tone})`, t: A.tone, txt: 1 }));
-  if (T.epa > 0 || objs.length) lines.push(bilRow('Épargne', objs.length ? (manque > 0.004 ? `${eurM(T.epa).replace(',00', '')} · il manque ${eurM(manque).replace(',00', '')}` : `${eurM(T.epa).replace(',00', '')} · objectif atteint`) : `${eurM(T.epa).replace(',00', '')} versés`, { dot: `var(--${objs.length && manque > 0.004 ? 'warn' : 'good'})`, t: objs.length && manque > 0.004 ? 'warn' : 'good', txt: 1 }));
-  if (tb) lines.push(bilRow('Budgets', `${eurM(ts).replace(',00', '')} sur ${eurM(tb).replace(',00', '')} · ${bt === 'bad' ? 'dépassés' : bt === 'warn' ? 'en avance' : R.isPast ? 'tenus' : 'dans le rythme'}`, { dot: `var(--${bt})`, t: bt === 'good' ? '' : bt, txt: 1 }));
-  if (worst) lines.push(bilRow(esc(worst.x.nom), worst.t === 'bad' ? `dépassé de ${eurM(worst.x.over)}` : `${pctTxt(worst.x.spent, worst.x.budget)} du budget au J${E.k}`, { dot: `var(--${worst.t})`, t: worst.t, txt: 1 }));
-  if (!R.isPast && fixFut.length) lines.push(bilRow('Charges fixes', `${fixFut.length} encore à venir · ${eurM(-fixFut.reduce((a, x) => a + x.v, 0))}`, { dot: 'var(--muted)', txt: 1 }));
-  if (b.B.todo.length) lines.push(bilRow('À classer', plur(b.B.todo.length, 'opération'), { dot: 'var(--warn)', t: 'warn', txt: 1 }));
-  const tF = tone(acc, b.fin);
-  const prevu = snap && (R.isPast || R.isCur) ? snap.atterAvec : null;
-  let html = `<section class="view bil"><button class="linkbtn back" data-tab="home">‹ Accueil</button>
-    <div class="bilhead"><h1>Bilan · ${esc(MONTHS_L[pm(c.mois).m])}${pm(c.mois).y !== pm(labelMonth(TODAY_ISO)).y ? ' ' + pm(c.mois).y : ''}</h1>${st}</div>
-    <div class="mono mini">${sub}</div>
-    <div class="bilnav"><button class="nb" data-cyc="-1" ${c.i > 0 ? '' : 'disabled'} aria-label="Cycle précédent">‹</button><span>${esc(shortAcc(acc))}</span><button class="nb" data-cyc="1" ${c.i < Math.min(cy.length - 1, cur.i + 11) ? '' : 'disabled'} aria-label="Cycle suivant">›</button></div>
-    <div class="bcard"><h2>En bref</h2>
-      <div class="bhi ${tF}"><span>${R.isPast ? 'Fin de cycle réelle' : 'Fin de cycle prévue'}</span><b class="mono">${sgnM(b.fin)}</b></div>
-      ${prevu !== null ? bilRow(R.isPast ? 'Prévu au début du cycle' : 'Prévu au début du cycle', sgnM(prevu), { sub: snap.late ? `(enregistré le ${fmtJ(snap.d)})` : '' }) + bilRow('<b>Écart</b>', sgnM(r2(b.fin - prevu)), { t: evTone(b.fin - prevu) }) : ''}
-      ${lines.join('')}</div>`;
-
-  // Ce qui a fait la différence (cycle terminé)
-  if (R.isPast) {
-    const D = bilDiffs(acc, b);
-    let rem = prevu !== null ? r2(b.fin - prevu - D.reduce((a, x) => a + x.v, 0)) : 0;
-    const sug = bilSugg(acc, b);
-    html += `<div class="bcard"><h2>Ce qui a fait la différence</h2>
-      <p class="mini">${prevu !== null ? 'Du plus gros écart au plus petit. En rouge ce qui t\'a coûté, en vert ce qui t\'a fait gagner.' : 'La prévision du début de ce cycle n\'a pas été enregistrée (cycle commencé avant la V3.3) : voici les écarts par rapport à ce qui était prévu.'}</p>
-      ${D.length ? D.slice(0, 8).map(x => bilRow(esc(x.lab), sgnN(x.v), { sub: '· ' + esc(x.sub), t: evTone(x.v) })).join('') : '<p class="mini">Tout s\'est passé comme prévu.</p>'}
-      ${D.length > 8 ? `<p class="mini">… et ${plur(D.length - 8, 'autre écart')} (${sgnN(r2(D.slice(8).reduce((a, x) => a + x.v, 0)))}).</p>` : ''}
-      ${prevu !== null && Math.abs(rem) >= 0.5 ? bilRow('Autres changements', sgnN(rem), { sub: '· budgets, fixes ou prévues modifiés en cours de cycle', t: evTone(rem) }) : ''}
-      ${prevu !== null ? bilRow('<b>Total</b>', sgnN(r2(b.fin - prevu)), { cls: 'tot', t: evTone(b.fin - prevu) }) : ''}
-      ${sug.map(s => `<div class="sugg"><span>${esc(s.nom)} dépasse son budget deux cycles de suite. Le passer à ${eurM(s.v).replace(',00', '')} pour les prochains cycles ?</span>
-        <div class="two"><button class="btn small" data-sugok="${esc(s.b.id)}|${s.v}">Passer à ${eurM(s.v).replace(',00', '')}</button><button class="btn small ghost" data-sugno="${esc(acc)}|${esc(s.nom)}|${esc(c.mois)}">Garder ${eurM(s.cur).replace(',00', '')}</button></div></div>`).join('')}
-    </div>`;
-  }
-
-  // Apports (commun) ou ton apport au commun (perso)
-  if (A && A.tot > 0) {
-    const cols = ['#7C8CF0', 'var(--accent)', '#4FA3C7', '#9B7BD8'];
-    html += `<div class="bcard"><h2>Apports des comptes perso</h2><p class="mini">Ce dont le commun a besoin sur le cycle, comparé à ce que vous y versez.</p>
-      ${bilRow('Charges fixes', nbM(T.fixe))}${bilRow('Budgets du quotidien', nbM(T.bud))}${T.hors > 0.004 ? bilRow('Hors budget et prévues', nbM(T.hors)) : ''}${T.todo > 0.004 ? bilRow('À classer', nbM(T.todo)) : ''}
-      ${A.epa > 0 ? bilRow('Épargne commune', nbM(A.epa), { sub: A.obj >= T.epa ? '(objectif)' : '' }) : ''}${bilRow('Seuil de confort', nbM(A.seuil))}
-      ${Math.abs(b.depart) >= 0.5 ? bilRow('Solde au départ du cycle', sgnN(-b.depart), { sub: b.depart > 0 ? '(déjà sur le compte)' : '(découvert à combler)' }) : ''}
-      ${bilRow('<b>Besoin conseillé</b>', `${eurM(A.part)}`, { cls: 'tot' })}
-      ${bilRow('<b>Apports</b>', `${eurM(A.tot)}`)}
-      <div class="stack">${A.ap.map((x, i) => `<i style="width:${(100 * x.v / A.tot).toFixed(1)}%;background:${cols[i % 4]}"></i>`).join('')}${A.part > 0 ? `<em style="left:${Math.min(100, 100 * A.part / Math.max(A.tot, A.part)).toFixed(1)}%"></em>` : ''}</div>
-      <div class="legend2">${A.ap.map((x, i) => `<span><i class="bdot" style="background:${cols[i % 4]}"></i>${esc(x.lab)} ${eurM(x.v).replace(',00', '')} (${pctTxt(x.v, A.tot)})</span>`).join('')}</div>
-      <div class="bhi ${A.tone}"><span>${A.marge >= -0.004 ? 'Apports suffisants' : A.tone === 'warn' ? 'Juste : sous le seuil de confort' : 'Apports insuffisants'}</span><b class="mono">${sgnM(A.marge)}</b></div>
-      ${A.ap.length > 1 ? `<div class="tile"><small>Au même partage, le besoin conseillé correspond à</small><span style="font-weight:600;color:var(--ink)">${A.ap.map(x => `${esc(x.lab)} ${eurM(r2(A.part * x.v / A.tot)).replace(',00', '')}`).join(' · ')}</span></div>` : ''}
-    </div>`;
-  }
-  if (mine) html += `<div class="bcard"><h2>Ton apport au commun</h2>
-      ${bilRow('Virement au commun ce cycle', eurM(mine.v))}${bilRow('Ta part des besoins du commun', eurM(mine.mine), { sub: `(${Math.round(100 * mine.share)} %)` })}
-      <div class="bhi ${mine.diff >= -0.004 ? 'good' : 'warn'}"><span>${mine.diff >= -0.004 ? 'Ton apport suffit' : 'Ton apport est en dessous de ta part'}</span><b class="mono">${sgnM(mine.diff)}</b></div>
-      <p class="mini">Les besoins du commun (charges fixes, budgets, épargne commune et seuil de confort) sont partagés au prorata des apports.</p>
-      <button class="linkbtn" data-acc="${esc(mine.com)}" data-bilacc="${esc(c.mois)}">Voir le bilan du commun</button></div>`;
-
-  // Entrées et sorties
-  const segs = [['fixe', T.fixe, 'var(--accent)'], ['bud', T.bud, '#7C8CF0'], ['hors', T.hors, '#B07CC6'], ['todo', T.todo, 'var(--muted)'], ['epa', T.epa, 'var(--good)']].filter(x => x[1] > 0.004);
-  const base = Math.max(T.rent + Math.max(0, b.depart), segs.reduce((a, x) => a + x[1], 0) + Math.max(0, b.fin));
-  html += `<div class="bcard"><h2>Entrées et sorties</h2><p class="mini">Ce que ${P ? 'devient ton salaire' : 'deviennent les apports'} sur le cycle.</p>
-    <div class="stack">${segs.map(x => `<i style="width:${(100 * x[1] / base).toFixed(1)}%;background:${x[2]}"></i>`).join('')}${b.fin > 0 ? `<i style="width:${(100 * b.fin / base).toFixed(1)}%;background:var(--${tF})"></i>` : ''}</div>
-    ${Math.abs(b.depart) >= 0.5 ? bilRow('Solde au départ', sgnN(b.depart)) : ''}
-    ${bilRow(`<b>${P ? 'Rentrées' : 'Apports et rentrées'}</b>`, eurM(T.rent))}
-    ${T.fixe > 0.004 ? bilRow('Charges fixes', sgnN(-T.fixe), { dot: 'var(--accent)', sub: T.com > 0 && P ? `(dont ${eurM(T.com).replace(',00', '')} vers le commun)` : '' }) : ''}
-    ${T.bud > 0.004 ? bilRow('Dépenses du quotidien', sgnN(-T.bud), { dot: '#7C8CF0', sub: R.isPast ? '(budgets)' : `(budgets, dont ${eurM(T.reserve).replace(',00', '')} encore réservés)` }) : ''}
-    ${T.hors > 0.004 ? bilRow('Hors budget et prévues', sgnN(-T.hors), { dot: '#B07CC6' }) : ''}
-    ${T.todo > 0.004 ? bilRow('À classer', sgnN(-T.todo), { dot: 'var(--muted)' }) : ''}
-    ${T.epa > 0.004 ? bilRow('Épargne versée', sgnN(-T.epa), { dot: 'var(--good)' }) : ''}
-    ${bilRow(`<b>Reste en fin de cycle</b>`, sgnM(b.fin), { cls: 'tot', t: tF, dot: `var(--${tF})` })}</div>`;
-
-  // Où part l'argent
-  const hasCom = P && T.com > 0, cats = bilCats(acc, b, !hasCom || UI.bilAll), totC = r2(cats.reduce((a, x) => a + x.v, 0)), mx = cats.length ? cats[0].v : 1;
-  const showN = UI.bilCats ? cats.length : 6;
-  html += `<div class="bcard"><h2>Où part l'argent</h2>
-    ${hasCom ? `<div class="seg2"><button data-bilall="0" aria-pressed="${!UI.bilAll}">Sans le commun</button><button data-bilall="1" aria-pressed="${!!UI.bilAll}">Tout</button></div>` : ''}
-    <p class="mini">Dépenses du cycle hors épargne${hasCom && !UI.bilAll ? ' et hors virement au commun' : ''} : ${eurM(totC)}${R.isPast ? '' : ' (réel + prévu)'}.</p>
-    ${cats.slice(0, showN).map(x => { const k = [...x.kinds], kl = k.includes('budget') ? 'budget' : k.includes('todo') ? 'à classer' : k.includes('fixe') ? (x.items.length > 1 ? 'fixes' : 'fixe') : 'hors budget';
-      const det = k.includes('budget') ? (() => { const bx = R.buds.find(y => y.nom === x.cat); return bx ? (R.isPast ? `${eurM(bx.spent)} dépensés pour ${eurM(bx.budget).replace(',00', '')} prévus` : `${eurM(bx.spent)} dépensés, ${eurM(R.isFut ? bx.budget : bx.reste)} réservés`) : ''; })()
-        : x.items.slice(0, 3).map(i => `${esc(i.lab)} ${eurM(i.v).replace(',00', '')}${i.fut ? ' à venir' : ''}`).join(' · ');
-      return `<div class="bcat"><div class="brow"><span>${esc(x.cat)} <small>· ${kl}</small></span><span class="mono">${nbM(x.v)} <small>${pctTxt(x.v, totC)}</small></span></div>
-        <div class="bar"><i style="width:${(100 * x.v / mx).toFixed(0)}%;background:${k.includes('budget') ? '#7C8CF0' : k.includes('todo') ? 'var(--muted)' : k.includes('fixe') ? 'var(--accent)' : '#B07CC6'}"></i></div>${det ? `<small>${det}</small>` : ''}</div>`; }).join('')}
-    ${cats.length > 6 ? `<button class="linkbtn" data-bilcats="1">${UI.bilCats ? 'Voir moins' : `Voir les ${cats.length - 6} autres catégories`}</button>` : ''}</div>`;
-
-  // Écarts (en cours et à venir ; le cycle terminé a « Ce qui a fait la différence »)
-  const tr = bilTrend(acc, b);
-  if (!R.isPast) {
-    const fixDiff = bilDiffs(acc, b).filter(x => x.sub.includes('au lieu de')), fixPast = b.B.fixe.filter(x => x.real).length;
-    const horsL = b.B.hors.filter(x => x.real && !prevOf(x.lien));
-    html += `<div class="bcard"><h2>Écarts</h2>
-      ${tb ? `<h3>Budgets${R.isCur ? `, au rythme du cycle (J${E.k}/${E.n} = ${E.pct} %)` : ''}</h3>
-      ${R.buds.map(x => { const t = budTone(acc, x.spent, x.budget, elPct); return bilRow(esc(x.nom), `${nbM(x.spent).replace(',00', '')} / ${nbM(x.budget).replace(',00', '')} € ${R.isFut ? '' : pill(t, t === 'bad' ? 'dépassé' : t === 'warn' ? 'en avance' : 'dans le rythme')}`); }).join('')}` : ''}
-      <h3>Charges fixes</h3>
-      ${fixDiff.length ? fixDiff.map(x => bilRow(esc(x.lab), sgnN(x.v), { sub: '· ' + esc(x.sub), t: evTone(x.v) })).join('') : bilRow(fixPast ? `${plur(fixPast, 'passée')}, toutes au montant prévu` : 'Aucune passée pour l\'instant', fixPast ? pill('good', 'ok') : '')}
-      ${fixFut.length ? bilRow(`${fixFut.length} à venir : ${fixFut.slice(0, 3).map(x => esc(x.label)).join(', ')}${fixFut.length > 3 ? '…' : ''}`, eurM(-fixFut.reduce((a, x) => a + x.v, 0))) : ''}
-      <h3>Hors budget et hors fixes</h3>
-      ${horsL.length ? horsL.slice(0, 5).map(x => bilRow(esc(x.label), sgnN(x.v), { sub: '· ' + esc(x.cat || 'sans catégorie'), t: 'bad' })).join('') : bilRow('Aucune dépense imprévue ce cycle', pill('good', 'ok'))}
-      ${b.B.todo.length ? bilRow(`${plur(b.B.todo.length, 'opération')} encore à classer`, sgnN(-T.todo), { t: 'warn' }) : ''}
-      <h3>Par rapport aux cycles précédents</h3>
-      ${tr ? (tr.L.length ? tr.L.map(x => bilRow(esc(x.cat), sgnN(-x.d), { sub: `· ${eurM(x.v).replace(',00', '')} contre ${eurM(x.a).replace(',00', '')} en moyenne`, t: evTone(-x.d) })).join('') : '<p class="mini">Rien de notable par rapport à ta moyenne des ' + tr.n + ' derniers cycles.</p>') : '<p class="mini">Disponible dès que 2 cycles seront terminés : les catégories en hausse ou en baisse par rapport à ta moyenne.</p>'}
-    </div>`;
-  }
-
-  // Épargne
-  if (livs.length || T.epa > 0.004) {
-    const msg = b.fin < -0.004 ? `La fin de cycle ${R.isPast ? 'a été' : 'sera'} négative : l'épargne de ce cycle creuse le découvert.`
-      : b.fin < seuil ? `${objs.length && manque <= 0.004 ? 'Objectif atteint. ' : ''}Les ${eurM(b.fin)} qui ${R.isPast ? 'sont restés' : 'resteront'} en fin de cycle sont sous ton seuil de confort (${eurM(seuil).replace(',00', '')}) : mieux vaut les laisser sur le compte.`
-      : `${objs.length && manque <= 0.004 ? 'Objectif atteint. ' : ''}Tu ${R.isPast ? 'aurais pu' : 'pourrais encore'} mettre ${eurM(r2(b.fin - seuil))} de côté en gardant ton seuil de confort (${eurM(seuil).replace(',00', '')}).`;
-    html += `<div class="bcard"><h2>Épargne</h2>
-      <div class="brow big"><span>Versé ce cycle</span><b class="mono t-good">${eurM(T.epa)}</b></div>
-      ${T.rent > 0 ? `<p class="mini">soit ${(100 * T.epa / T.rent).toFixed(1).replace('.', ',')} % ${P ? 'de tes rentrées' : 'des apports'}</p>` : ''}
-      ${livs.map(l => { const v = byLiv(l.id), o = num(l.objectif) || 0;
-        return o > 0 ? `<div class="bcat">${bilRow(esc(l.nom), `${nbM(v).replace(',00', '')} / ${nbM(o).replace(',00', '')} € ${v >= o - 0.004 ? '<b class="t-good">✓</b>' : ''}`)}<div class="bar"><i style="width:${Math.min(100, Math.round(100 * Math.max(0, v) / o))}%;background:var(--${v >= o - 0.004 ? 'good' : 'warn'})"></i></div></div>`
-          : bilRow(esc(l.nom), v ? eurM(v) : '<small>pas de versement ni d\'objectif</small>'); }).join('')}
-      <div class="bnote ${tF}">${msg}</div></div>`;
-  }
-
-  // Capacités
-  const nx = cy[c.i + 1], NX = nx ? cycleCalc(acc, nx) : null, restD = Math.max(1, E.n - E.k);
-  const tiles = [`<div class="tile"><small>Capacité d'épargne du cycle</small><b class="mono">${eurM(T.capa)}</b><small>ce qui reste après fixes et budgets${T.capa > 0 && T.epa > 0 ? ` · ${eurM(T.epa).replace(',00', '')} épargnés (${pctTxt(T.epa, T.capa)})` : ''}</small></div>`];
-  if (R.isCur && tb) tiles.push(`<div class="tile"><small>Reste à dépenser dans tes budgets</small><b class="mono">${eurM(R.reserve)}</b><small>soit ${eurM(r2(R.reserve / restD))} par jour pendant ${plur(restD, 'jour')}</small></div>`);
-  if (!R.isPast) tiles.push(`<div class="tile"><small>Achat possible sans découvert</small><b class="mono">${eurM(Math.max(0, Math.floor(R.atterAvec))).replace(',00', '')}</b><small>en gardant tous ${P ? 'tes' : 'les'} budgets</small></div>`);
-  if (R.isPast && T.rent > 0) tiles.push(`<div class="tile"><small>Taux d'épargne</small><b class="mono">${(100 * T.epa / T.rent).toFixed(1).replace('.', ',')} %</b><small>${P ? 'des rentrées' : 'des apports'} du cycle</small></div>`);
-  if (tr) tiles.push(`<div class="tile"><small>Capacité moyenne (${tr.n} cycles)</small><b class="mono">${eurM(tr.capa)}</b><small>sur les cycles terminés précédents</small></div>`);
-  if (NX && !R.isPast) { const ev = r2(NX.atterAvec - NX.depart); tiles.push(`<div class="tile"><small>Cycle suivant (${esc(MONTHS_L[pm(nx.mois).m])})</small><b class="mono t-${evTone(ev)}">${sgnM(ev)}</b><small>évolution prévue sur le cycle</small></div>`); }
-  html += `<div class="bcard"><h2>${P ? 'Tes capacités' : 'Capacités du commun'}</h2><div class="tiles2">${tiles.join('')}</div></div></section>`;
-  return html;
-}
-
-/* ----- Événements V3.3 ----- */
-document.addEventListener('click', ev => {
-  const t = ev.target.closest('button'); if (!t) return;
-  const ds = t.dataset, acc = UI.acc;
-  if (ds.bilan) { if (ds.bilan !== '1') { UI.cyc[acc] = ds.bilan; store.set('le31-bilvu|' + acc + '|' + ds.bilan, true); } UI.tab = 'bil'; UI.bilCats = false; render(); scrollTo(0, 0); return; }
-  if (ds.bilvu) { store.set('le31-bilvu|' + acc + '|' + ds.bilvu, true); render(); return; }
-  if (ds.bilall) { UI.bilAll = ds.bilall === '1'; render(); return; }
-  if (ds.bilcats) { UI.bilCats = !UI.bilCats; render(); return; }
-  if (ds.bilacc) { const a = ds.acc, m = ds.bilacc; setTimeout(() => { if (cycleByMois(a, m)) UI.cyc[a] = m; UI.tab = 'bil'; render(); scrollTo(0, 0); }, 0); return; }
-  if (ds.sugok) { const [id, v] = ds.sugok.split('|'); commit([upd('Budgets', { id, budget: v })]); toast('Budget mis à jour pour les prochains cycles'); return; }
-  if (ds.sugno) { store.set('le31-sugno|' + ds.sugno, true); render(); return; }
 });
 function copyText(txt, el) {
   const done = () => toast('Copié');
