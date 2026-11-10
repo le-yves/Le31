@@ -3,7 +3,7 @@
 :root{
   --bg:#EDF0F6; --surface:#FFFFFF; --sunk:#E3E7F0; --ink:#141A2E; --muted:#5A6480; --line:#D6DCE8;
   --accent:#2F4BD8; --accent-ink:#FFFFFF; --accent-soft:#E2E7FC;
-  --seg-on:#FFFFFF; --good:#1C8556; --good-soft:#DDF2E7; --warn:#B8700A; --warn-soft:#FBEBD2; --bad:#C3322A; --bad-soft:#F9DEDC;
+  --seg-on:#FFFFFF; --good:#1C8556; --good-soft:#DDF2E7; --warn:#A86000; --warn-soft:#FFF4E2; --bad:#C3322A; --bad-soft:#F9DEDC;
   --f-display:"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
   --f-body:"Figtree", "Segoe UI", system-ui, sans-serif;
   --f-mono:"IBM Plex Mono", ui-monospace, Menlo, monospace;
@@ -397,3 +397,34 @@ svg.chart .lab text{font-family:var(--f-mono);font-size:10px;fill:var(--muted)}
 .trow5{white-space:nowrap;font-size:12px;gap:4px;padding:9px 12px}
 .trow5 span{overflow:hidden;text-overflow:ellipsis}
 .mrow .mini{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ===== V3.2 : couleurs de l'accueil, jour par jour inversé, tableaux Début / Fin / Évolution ===== */
+.t-good{color:var(--good)} .t-warn{color:var(--warn)} .t-bad{color:var(--bad)}
+.kv1 b[class*="t-"]{font-weight:600}
+.kv1.main{border-top:0;margin:6px -10px 8px;padding:12px 10px;border-radius:12px}
+.kv1.main.good{background:var(--good-soft)} .kv1.main.good b{color:var(--good)}
+.kv1.main.warn{background:var(--warn-soft)} .kv1.main.warn b{color:var(--warn)}
+.kv1.main.bad{background:var(--bad-soft)} .kv1.main.bad b{color:var(--bad)}
+.kvb{display:flex;flex-direction:column;gap:8px;padding:13px 0 14px;border-top:1px solid var(--line)}
+.kvt{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.kvt>span:first-child{font-size:14px;color:var(--muted)} .kvt b{font-size:16px;font-weight:600} .kvt em{font-style:normal;font-size:14px;color:var(--muted)}
+.kvs{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.bar i.good{background:var(--good)} .bar i.warn{background:var(--warn)} .bar i.bad{background:var(--bad)}
+.kvb .bar,.env2 .bar{overflow:visible}
+.kvb .bar em,.env2 .bar em{top:-4px;bottom:-4px;width:2px;background:var(--ink);opacity:.85;border-radius:1px}
+.jpjend{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:11px 12px;margin:0 -8px 4px;background:var(--accent-soft);border-radius:12px;font-size:14px;font-weight:700}
+.jpjend small{display:block;font-size:12px;font-weight:500;color:var(--muted)} .jpjend b{font-size:16px;font-weight:600}
+.dayfoot{display:flex;justify-content:space-between;font-size:13px;color:var(--muted);padding:11px 0 4px}
+.dayrow.fut,.mrow.fut,.trow5.fut{font-style:normal;color:var(--ink)}
+.dayrow.fut .dv>span{color:var(--muted)}
+.mrow.m4{grid-template-columns:minmax(0,1fr) 72px 72px 80px;gap:6px;align-items:baseline}
+.mrow.m4>span:not(:first-child){text-align:right;font-size:12px;white-space:nowrap}
+.mrow.m4 .b{font-weight:600}
+.mrow.m4.h>span{font-size:10px}
+.cyrow.c4{grid-template-columns:minmax(0,1fr) 62px 66px 78px;gap:5px;align-items:baseline}
+.cyrow.c4 .n{text-align:right;font-size:12px;white-space:nowrap}
+.cyrow.c4.h>span:not(:first-child){text-align:right}
+.cyrow.c4 .a small{overflow-wrap:anywhere}
+.colset{display:flex;flex-direction:column;gap:10px;background:var(--sunk);border-radius:12px;padding:12px}
+.colset>b{font-size:13px}
+.chips3{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
