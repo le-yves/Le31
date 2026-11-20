@@ -295,6 +295,11 @@ details.jpj[open] summary svg{transform:rotate(180deg)}
 .dayrow .dd{font-size:12px;color:var(--muted)}
 .dayrow .dl{min-width:0;overflow-wrap:anywhere}
 .dayrow .dl small{display:block;font-size:12px;color:var(--muted)}
+.jpi{background:none;border:0;padding:0;margin:0;font:inherit;color:inherit;text-align:left;cursor:pointer;text-decoration:underline dotted var(--line);text-underline-offset:3px}
+.jpi.corr,.corrl{color:var(--muted)}
+.dayrow .dl small .jpi,.dayrow .dl small .jpl{display:block;padding:3px 0}
+.dayrow .dl small .tag{font-size:11px;padding:1px 6px}
+.corrl{font-style:normal}.corrl::before{content:'⇄ '}
 .dayrow .dv{text-align:right;white-space:nowrap}.dayrow .dv small{display:block;font-size:12px;color:var(--muted)}
 .dayrow.fut{color:var(--muted);font-style:italic}
 .todaymark{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--accent)}

@@ -3,7 +3,7 @@
    à la veille du suivant. Opérations lues à la banque (Enable Banking), classées à la main le premier cycle (« À classer »),
    puis automatiquement quand c'est sûr. Données : Google Sheet via Google Apps Script (Code.gs 3.1). */
 'use strict';
-const APP_VERSION = '3.3.1';
+const APP_VERSION = '3.3.2';
 
 /* ================= Outils ================= */
 const MONTHS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
@@ -191,8 +191,9 @@ function received(data, moi) {
   rebuild(); setSync();
   ensurePerso();
   migrate31();
+  const tidy = corrTidy(); if (tidy.length) { stage(tidy); flush(); }
   setTimeout(bankAuto, 0);
-  if (first || before !== JSON.stringify(RAW) + ME) {
+  if (first || tidy.length || before !== JSON.stringify(RAW) + ME) {
     // ne pas re-dessiner pendant qu'on tape dans un champ
     const a = document.activeElement;
     if (!a || !/INPUT|SELECT|TEXTAREA/.test(a.tagName) || first) render();
@@ -708,6 +709,57 @@ function newCatOps(acc, nom) {
 // Écritures appliquées tout de suite en local (les suivantes en tiennent compte), envoyées en une fois
 function stage(ops) { clean(ops); QUEUE.push(...ops); store.set('le31-file', QUEUE); ops.forEach(applyLocal); CACHE = {}; }
 const lastBankDate = acc => DB.mouvements.filter(o => o.compte === acc && String(o.ref || '').startsWith('bk|')).reduce((m, o) => o.date > m ? o.date : m, '');
+/* V3.3.2 : corrections de solde. La banque retire parfois une opération du solde avant de la montrer dans la liste.
+   Avant : une correction à chaque écart, puis une correction inverse quand l'opération arrivait (des paires qui s'annulent).
+   Maintenant : une seule ligne « Correction (solde de la banque) » par compte et par cycle (id compte|corr|mois),
+   mise à jour à chaque lecture de la banque et supprimée quand l'écart revient à 0. */
+const CORR_LIB = 'Correction (solde de la banque)';
+const isAutoCorr = o => o.type === 'ajust' && !o.ref && (o.libelle === CORR_LIB || /\|corr\|/.test(o.id));
+const corrKey = (acc, c) => acc + '|corr|' + c.mois;
+const corrsIn = (acc, c) => DB.mouvements.filter(o => o.compte === acc && isAutoCorr(o) && o.date >= c.debut && o.date <= c.fin);
+const corrSum = l => r2(l.reduce((a, o) => a + (num(o.montant) || 0), 0));
+// Fixe la correction du cycle à « total » (une seule ligne, ou aucune si total = 0)
+function corrSet(acc, c, total, date) {
+  const l = corrsIn(acc, c), key = corrKey(acc, c), k = l.find(o => o.id === key), ops = [];
+  l.forEach(o => { if (o.id !== key) ops.push(del('Mouvements', o.id)); });
+  total = r2(total);
+  if (Math.abs(total) < 0.005) { if (k) ops.push(del('Mouvements', key)); }
+  else {
+    const d = date || l.reduce((m, o) => o.date > m ? o.date : m, c.debut);
+    if (!k || Math.abs((num(k.montant) || 0) - total) >= 0.005 || k.date !== d)
+      ops.push(upd('Mouvements', { id: key, compte: acc, date: d, montant: total, libelle: CORR_LIB, nom: CORR_LIB, categorie: '', type: 'ajust', lien: '', auto: '', ref: '', profil: ME || '', livret: '' }));
+  }
+  return ops;
+}
+// Un écart avec la banque : il annule d'abord une correction de sens contraire (cycle en cours, puis cycle précédent
+// si le départ du cycle en cours en découle), le reste va dans la correction du cycle en cours.
+function corrAbsorb(acc, iso, delta) {
+  const cur = cycleAt(acc, iso); if (!cur) return;
+  const ops = [], sg = Math.sign(delta);
+  let sumCur = corrSum(corrsIn(acc, cur)), left = r2(delta);
+  // 1. contre la correction du cycle en cours
+  if (sumCur && Math.sign(sumCur) !== sg) { const a = sg * Math.min(Math.abs(sumCur), Math.abs(left)); sumCur = r2(sumCur + a); left = r2(left - a); }
+  // 2. contre celle du cycle précédent (l'opération attendue est souvent datée de la fin du cycle précédent)
+  const prev = cyclesOf(acc)[cur.i - 1], derived = num(cur.row.soldeDepart) === null || cur.row.soldeDepart === '';
+  if (Math.abs(left) >= 0.005 && prev && derived) {
+    const sp = corrSum(corrsIn(acc, prev));
+    if (sp && Math.sign(sp) !== sg) { const a = sg * Math.min(Math.abs(sp), Math.abs(left)); left = r2(left - a); ops.push(...corrSet(acc, prev, sp + a)); }
+  }
+  ops.push(...corrSet(acc, cur, sumCur + left, Math.abs(left) >= 0.005 ? iso : null));
+  if (ops.length) stage(ops);
+}
+// Nettoyage des anciennes paires : dans chaque cycle, les corrections sont regroupées en une seule (ou supprimées si elles s'annulent)
+function corrTidy() {
+  if (!LOADED) return [];
+  const ops = [], accIds = [...new Set(DB.mouvements.filter(isAutoCorr).map(o => o.compte))];
+  accIds.forEach(acc => cyclesOf(acc).forEach(c => {
+    const l = corrsIn(acc, c); if (!l.length) return;
+    const s = corrSum(l);
+    if (l.length === 1 && l[0].id === corrKey(acc, c) && Math.abs(s) >= 0.005) return;
+    ops.push(...corrSet(acc, c, s));
+  }));
+  return ops;
+}
 function ingest(acc, tx, solde, st) {
   const S = st || v3(acc), res = { n: 0, auto: 0, todo: 0, recal: 0 };
   if (!S || !S.debut) return res;
@@ -729,9 +781,9 @@ function ingest(acc, tx, solde, st) {
     if (st) { // démarrage : solde de départ = solde de la banque − opérations depuis le début du cycle
       const sum = DB.mouvements.filter(o => o.compte === acc && o.date >= S.debut && o.date <= solde.date).reduce((a, o) => a + (num(o.montant) || 0), 0);
       stage([upd('Cycles', { id: acc + '|' + S.mois, compte: acc, mois: S.mois, debut: S.debut, montant: S.montant || '', soldeDepart: r2(solde.montant - sum), manuel: 'b' })]);
-    } else if (solde.date >= S.debut) { // recalage : la banque fait foi
+    } else if (solde.date >= S.debut) { // recalage : la banque fait foi (V3.3.2 : une seule correction par cycle, qui bouge)
       const b = balanceAt(acc, solde.date), delta = b === null ? 0 : r2(solde.montant - b);
-      if (Math.abs(delta) >= 1) { stage([upd('Mouvements', { id: uid(), compte: acc, date: solde.date, montant: delta, libelle: 'Correction (solde de la banque)', nom: 'Correction (solde de la banque)', categorie: '', type: 'ajust', lien: '', auto: '', ref: '', profil: '' })]); res.recal = delta; }
+      if (Math.abs(delta) >= 1) { corrAbsorb(acc, solde.date, delta); res.recal++; }
     }
   }
   return res;
@@ -1152,8 +1204,11 @@ function vJpj(acc, c, R) {
     if (!marked && dd.d <= TODAY_ISO) { rows.push(todayMark); marked = true; }
     if (!dd.items.length && !UI.jpjAll) return;
     const fut = dd.d > TODAY_ISO, l = dd.items, one = l.length === 1 ? l[0] : null, allPrev = l.length && l.every(x => !x.real);
-    const lab = !l.length ? '<span class="mini">—</span>' : one ? `${esc(one.label)}${one.real ? (one.kind === 'todo' ? ' <span class="tag w">à classer</span>' : '') : ` <span class="tag g">${one.late ? 'pas encore vu' : 'prévu'}</span>`}`
-      : `${l.length} mouvements${allPrev ? ' <span class="tag g">prévu</span>' : ''}<small>${l.map(x => `${esc(x.label)} ${eurM(x.v).replace('− ', '−')}`).join(' · ')}</small>`;
+    // V3.3.2 : chaque opération réelle se touche pour l'ouvrir (classer, corriger) ; les corrections de solde sont à part, en gris
+    const nm = x => x.kind === 'ajust' ? '<span class="corrl">Correction banque</span>' : esc(x.label);
+    const tap = (x, h) => x.real && x.id ? `<button type="button" class="jpi${x.kind === 'ajust' ? ' corr' : ''}" data-oid="${esc(x.id)}">${h}</button>` : `<span class="jpl">${h}</span>`;
+    const lab = !l.length ? '<span class="mini">—</span>' : one ? tap(one, `${nm(one)}${one.real ? (one.kind === 'todo' ? ' <span class="tag w">à classer</span>' : '') : ` <span class="tag g">${one.late ? 'pas encore vu' : 'prévu'}</span>`}`)
+      : `${l.length} mouvements${allPrev ? ' <span class="tag g">prévu</span>' : ''}<small>${l.map(x => tap(x, `${nm(x)} ${eurM(x.v).replace('− ', '−')}${x.kind === 'todo' ? ' <span class="tag w">à classer</span>' : ''}`)).join('')}</small>`;
     rows.push(`<div class="dayrow ${fut || allPrev ? 'fut' : ''}"><span class="mono dd">${wd(dd.d)} ${fmtJ(dd.d)}</span><span class="dl">${lab}</span><span class="mono dv">${l.length ? `<span class="${dd.mv > 0 ? 'pos' : ''}">${sgn(dd.mv)}</span>` : ''}<small>${eurM(dd.bal)}</small></span></div>`);
   });
   if (!marked) rows.push(todayMark);
@@ -1660,7 +1715,7 @@ function opSheet(o) {
   openSheet(`<form class="form" id="opForm" data-id="${esc(o.id)}" novalidate>
     <div class="rowhead"><h2>${esc(nameOf(o))}</h2><span class="mono">${sgn(v)}</span></div>
     ${o.ref ? `<div class="raw">${esc(o.libelle)} · ${fmtJA(o.date)} · banque</div>` : ''}
-    ${o.type === 'ajust' ? `<div class="note">Correction ajoutée pour que le solde de Le 31 soit égal à celui de la banque (${fmtJA(o.date)}).</div>` : `
+    ${o.type === 'ajust' ? `<div class="note">Écart avec le solde de la banque, mis à jour à chaque lecture de la banque (dernière : ${fmtJA(o.date)}). Il vient le plus souvent d'une opération que la banque a déjà retirée du solde mais pas encore affichée dans la liste : il disparaît tout seul quand elle arrive.</div>` : `
     <div class="seg seg${kinds.length}" id="opKinds">${kinds.map(([x, l]) => `<button type="button" data-okind="${x}" aria-pressed="${k === x}">${l}</button>`).join('')}</div>
     ${man ? `<div class="two"><div class="field"><label for="oD">Date</label><input type="date" id="oD" value="${esc(o.date)}"></div><div class="field"><label for="oA">Montant (€)</label><input id="oA" inputmode="decimal" value="${fr(Math.abs(v))}"></div></div>
       <div class="field"><label for="oL">Libellé</label><input id="oL" value="${esc(o.libelle)}"></div>` : `<div class="field"><label for="oN">Nom</label><input id="oN" value="${esc(nameOf(o))}"></div>`}
